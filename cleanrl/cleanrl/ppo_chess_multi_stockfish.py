@@ -17,7 +17,7 @@ import chess
 from pettingzoo.classic import chess_v6
 
 # 공통 모듈 임포트
-from other_model.chess_minimax import get_best_move_minimax, encode_move, PIECE_VALUES
+from other_model.chess_minimax import get_best_move_stockfish, encode_move, PIECE_VALUES
 
 # ==============================
 #  ChessSelfPlayEnv (Modified for Random Colors)
@@ -79,7 +79,7 @@ class ChessSelfPlayEnv(gym.Env):
         board = raw_env.board
         
         # Minimax로 최적 수 찾기
-        best_move = get_best_move_minimax(board, depth=self.opponent_depth)
+        best_move = get_best_move_stockfish(board, time_limit=0.01)
         
         if best_move is None:
             curr = self.aec_env.agent_selection

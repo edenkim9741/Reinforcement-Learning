@@ -5,6 +5,30 @@ import chess
 #  (PettingZoo 호환을 위해 chess.Move를 int형 Action ID로 변환)
 # =============================================================================
 
+import chess
+import chess.engine
+
+# Stockfish 경로 (설치된 경로 확인 필요, 보통 /usr/games/stockfish 또는 /usr/bin/stockfish)
+# Mac Homebrew의 경우: "/opt/homebrew/bin/stockfish" 등
+STOCKFISH_PATH = "/usr/games/stockfish"  # [수정 필요] 본인 경로 입력
+
+# 엔진 인스턴스 (전역으로 하나만 띄워두고 재사용 추천)
+engine = None
+
+def get_best_move_stockfish(board: chess.Board, time_limit=0.01):
+    global engine
+    if engine is None:
+        try:
+            # SimpleEngine으로 프로세스 실행
+            engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+        except FileNotFoundError:
+            print(f"[ERROR] Stockfish not found at {STOCKFISH_PATH}. Please install it.")
+            return None
+
+    # time_limit(초) 만큼만 생각하고 수를 둠 (0.01초면 매우 빠름)
+    result = engine.play(board, chess.engine.Limit(time=time_limit))
+    return result.move
+
 def square_to_coord(s):
     col = s % 8
     row = s // 8
@@ -120,31 +144,60 @@ PIECE_VALUES = {
 
 def evaluate_board(board: chess.Board):
     if board.is_checkmate():
-        # White 승리시 양수, Black 승리시 음수
         return -9999 if board.turn == chess.WHITE else 9999
     
     if board.is_stalemate() or board.is_insufficient_material():
         return 0
 
+    # 기존 for loop 제거 -> Bitboard 연산으로 대체
+    # (White 점수 - Black 점수)
     score = 0
-    # 모든 기물 스캔
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            value = PIECE_VALUES.get(piece.piece_type, 0)
-            if piece.color == chess.WHITE:
-                score += value
-            else:
-                score -= value
+    
+    # Pawn (1점)
+    score += 1 * (len(board.pieces(chess.PAWN, chess.WHITE)) - len(board.pieces(chess.PAWN, chess.BLACK)))
+    # Knight (3점)
+    score += 3 * (len(board.pieces(chess.KNIGHT, chess.WHITE)) - len(board.pieces(chess.KNIGHT, chess.BLACK)))
+    # Bishop (3점)
+    score += 3 * (len(board.pieces(chess.BISHOP, chess.WHITE)) - len(board.pieces(chess.BISHOP, chess.BLACK)))
+    # Rook (5점)
+    score += 5 * (len(board.pieces(chess.ROOK, chess.WHITE)) - len(board.pieces(chess.ROOK, chess.BLACK)))
+    # Queen (9점)
+    score += 9 * (len(board.pieces(chess.QUEEN, chess.WHITE)) - len(board.pieces(chess.QUEEN, chess.BLACK)))
+    
     return score
+
+def order_moves(board, moves):
+    """
+    좋은 수(잡는 수, 승진 등)를 리스트 앞쪽으로 배치
+    """
+    def score_move(move):
+        score = 0
+        # 1. 기물을 잡는 수 (높은 점수)
+        if board.is_capture(move):
+            # MVV-LVA (Most Valuable Victim - Least Valuable Aggressor)의 단순화 버전
+            # 잡히는 기물의 가치가 높을수록 우선순위 둠
+            if board.is_en_passant(move):
+                score += 10 # 폰 잡음
+            else:
+                victim = board.piece_at(move.to_square)
+                if victim:
+                    score += PIECE_VALUES[victim.piece_type] * 10
+        
+        # 2. 승진하는 수
+        if move.promotion:
+            score += 90 # 퀸 승진 등은 매우 중요
+            
+        return score
+
+    # 점수가 높은 순으로 정렬 (내림차순)
+    return sorted(moves, key=score_move, reverse=True)
 
 def minimax(board: chess.Board, depth: int, alpha: float, beta: float, maximizing_player: bool):
     if depth == 0 or board.is_game_over():
         return evaluate_board(board)
 
-    legal_moves = list(board.legal_moves)
-    # 간단한 Move Ordering (잡는 수 우선 탐색 - 성능 향상용)
-    # legal_moves.sort(key=lambda m: board.is_capture(m), reverse=True)
+    # [수정] 정렬된 Move 리스트 사용
+    legal_moves = order_moves(board, list(board.legal_moves))
 
     if maximizing_player:
         max_eval = -float('inf')

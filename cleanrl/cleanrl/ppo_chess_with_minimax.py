@@ -9,20 +9,23 @@ import chess
 from pettingzoo.classic import chess_v6
 
 # [NEW] 공통 모듈 임포트
-from minimax.chess_minimax import get_best_move_minimax, encode_move
+from other_model.chess_minimax import get_best_move_minimax, encode_move, get_best_move_stockfish
 
 # ==============================
 #  Helpers & Model
 # ==============================
 
-def select_action_minimax(env, obs_dict):
+def select_action_minimax(env, obs_dict, use_stockfish=False):
     raw_env = env.unwrapped 
     if not hasattr(raw_env, 'board'):
         if hasattr(env, 'env'): raw_env = env.env
     board = raw_env.board
     
     # Eval할 때는 보통 조금 더 똑똑한 상대를 원할 수 있으므로 depth=2
-    best_move = get_best_move_minimax(board, depth=2)
+    if use_stockfish:
+        best_move = get_best_move_stockfish(board, time_limit=0.01)
+    else:
+        best_move = get_best_move_minimax(board, depth=2)
     
     if best_move is None:
         mask = obs_dict["action_mask"]
@@ -76,7 +79,7 @@ def make_env():
     return env
 
 def build_model(device, checkpoint_path: str):
-    if checkpoint_path is None or checkpoint_path.lower() == "minimax":
+    if checkpoint_path is None or checkpoint_path.lower() == "minimax" or checkpoint_path.lower() == "stockfish":
         return None
     
     tmp_env = make_env()
@@ -120,6 +123,7 @@ def play_game(game_idx, agent_model, opponent_model, opponent_type, device):
         model_p0, type_p0 = opponent_model, opponent_type
         model_p1, type_p1 = agent_model, "model"
         agent_as_p0 = False
+
         
     rewards = {agent: 0.0 for agent in env.agents}
     for agent in env.agent_iter():
@@ -133,8 +137,10 @@ def play_game(game_idx, agent_model, opponent_model, opponent_type, device):
             else:
                 cur_model, cur_type = model_p1, type_p1
                 
-            if cur_type == "minimax":
+            if cur_type == "minimax" :
                 action = select_action_minimax(env, obs)
+            elif cur_type == "stockfish":
+                action = select_action_minimax(env, obs, use_stockfish=True)
             elif cur_type == "model" and cur_model:
                 action = select_action_model(cur_model, obs, device)
             else:
@@ -174,11 +180,14 @@ def main():
 
     agent_model = build_model(device, args.agent_checkpoint)
     
-    opponent_type = "minimax"
+    opponent_types = ("minimax", "stockfish")
     opponent_model = None
-    if args.opponent_checkpoint != "minimax" and args.opponent_checkpoint is not None:
+    opponent_type = None
+    if args.opponent_checkpoint not in opponent_types and args.opponent_checkpoint is not None:
         opponent_type = "model"
         opponent_model = build_model(device, args.opponent_checkpoint)
+    else:
+        opponent_type = args.opponent_checkpoint
 
     my_games = [i for i in range(args.n_games) if i % world_size == rank]
     local_stats = torch.zeros(3, dtype=torch.int, device=device) 

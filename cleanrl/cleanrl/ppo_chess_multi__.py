@@ -292,7 +292,7 @@ class PPOConfig:
     seed: int = 1
     total_timesteps: int = 5_000_000
     learning_rate: float = 2.5e-4
-    num_steps: int = 512  # rollout horizon
+    num_steps: int = 256  # rollout horizon
     num_envs: int = 32  # 병렬 환경 수
     gamma: float = 0.99
     gae_lambda: float = 0.95
