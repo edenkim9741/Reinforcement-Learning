@@ -1,23 +1,45 @@
 import argparse
 import os
-from typing import Optional
-
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
-
+import torch.distributed as dist
+import chess
 from pettingzoo.classic import chess_v6
 
+# [NEW] 공통 모듈 임포트
+from minimax.chess_minimax import get_best_move_minimax, encode_move
 
 # ==============================
-#  ActorCritic (학습 때 쓰던 거랑 동일 구조)
+#  Helpers & Model
 # ==============================
+
+def select_action_minimax(env, obs_dict):
+    raw_env = env.unwrapped 
+    if not hasattr(raw_env, 'board'):
+        if hasattr(env, 'env'): raw_env = env.env
+    board = raw_env.board
+    
+    # Eval할 때는 보통 조금 더 똑똑한 상대를 원할 수 있으므로 depth=2
+    best_move = get_best_move_minimax(board, depth=2)
+    
+    if best_move is None:
+        mask = obs_dict["action_mask"]
+        return env.action_space(env.agent_selection).sample(mask)
+
+    try:
+        # 흑번이면 mirror=True
+        action = encode_move(best_move, should_mirror=(board.turn == chess.BLACK))
+    except:
+        mask = obs_dict["action_mask"]
+        return env.action_space(env.agent_selection).sample(mask)
+    return action
+
 class ActorCritic(nn.Module):
     def __init__(self, obs_shape, n_actions):
         super().__init__()
         self.h, self.w, self.c = obs_shape
-    
-
         self.network = nn.Sequential(
             nn.Conv2d(self.c, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
@@ -29,249 +51,160 @@ class ActorCritic(nn.Module):
             nn.Linear(128 * self.h * self.w, 512),
             nn.ReLU(),
         )
-
         self.actor = nn.Linear(512, n_actions)
         self.critic = nn.Linear(512, 1)
 
     def get_value(self, obs):
-        obs = obs.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
+        obs = obs.permute(0, 3, 1, 2)
         hidden = self.network(obs)
-        return self.critic(hidden).squeeze(-1)  # (B,)
+        return self.critic(hidden).squeeze(-1)
 
     def get_action_and_value(self, obs, action=None, action_mask=None):
-        obs = obs.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
+        obs = obs.permute(0, 3, 1, 2)
         hidden = self.network(obs)
-        logits = self.actor(hidden)  # (B, n_actions)
-
+        logits = self.actor(hidden)
         if action_mask is not None:
-            # illegal move의 logit을 매우 작은 값으로 마스킹 → 선택 불가
             logits = logits.masked_fill(action_mask == 0, -1e9)
-
         dist = torch.distributions.Categorical(logits=logits)
-
         if action is None:
-            action = dist.sample()  # (B,)
+            action = dist.sample()
+        return action, dist.log_prob(action), dist.entropy(), self.critic(hidden).squeeze(-1)
 
-        log_prob = dist.log_prob(action)  # (B,)
-        entropy = dist.entropy()          # (B,)
-        value = self.critic(hidden).squeeze(-1)  # (B,)
-
-        return action, log_prob, entropy, value
-
-
-# ==============================
-#  유틸 함수들
-# ==============================
-
-def make_env(render_mode=None):
-    env = chess_v6.env(render_mode=render_mode)
+def make_env():
+    env = chess_v6.env(render_mode=None)
     env.reset()
     return env
 
-
-def build_model(device, checkpoint_path: Optional[str]) -> Optional[ActorCritic]:
-    """
-    checkpoint_path가 주어지면 ActorCritic을 만들어서 weight 로드,
-    안 주어지면 None 반환 (→ 랜덤 정책으로 사용)
-    """
-    if checkpoint_path is None:
+def build_model(device, checkpoint_path: str):
+    if checkpoint_path is None or checkpoint_path.lower() == "minimax":
         return None
-
-    # env 하나 열어서 observation / action space 파악
-    tmp_env = make_env(render_mode=None)
+    
+    tmp_env = make_env()
     obs_space = tmp_env.observation_space("player_0")["observation"]
     act_space = tmp_env.action_space("player_0")
-    obs_shape = obs_space.shape
-    n_actions = act_space.n
+    model = ActorCritic(obs_space.shape, act_space.n).to(device)
     tmp_env.close()
 
-    model = ActorCritic(obs_shape, n_actions).to(device)
     state_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
     return model
 
-
 @torch.no_grad()
-def select_action_model(model: ActorCritic, obs_dict, device):
-    """
-    ActorCritic 모델로부터 행동 하나 샘플
-    obs_dict: {"observation": ..., "action_mask": ...}
-    """
-    obs_np = obs_dict["observation"].astype(np.float32)
-    mask_np = obs_dict["action_mask"].astype(np.float32)
+def select_action_model(model, obs_dict, device):
+    # .copy() 필수
+    obs_np = obs_dict["observation"].copy()
+    mask_np = obs_dict["action_mask"].copy()
+    
+    obs = torch.tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
+    mask = torch.tensor(mask_np, dtype=torch.float32, device=device).unsqueeze(0)
+    
+    action, _, _, _ = model.get_action_and_value(obs, action_mask=mask)
+    return int(action.item())
 
-    obs_t = torch.tensor(obs_np, dtype=torch.float32, device=device).unsqueeze(0)
-    mask_t = torch.tensor(mask_np, dtype=torch.float32, device=device).unsqueeze(0)
+def select_action_random(env, agent_name, obs_dict):
+    return env.action_space(agent_name).sample(obs_dict["action_mask"])
 
-    action_t, _, _, _ = model.get_action_and_value(obs_t, action_mask=mask_t)
-    return int(action_t.item())
+# ==============================
+#  Main (DDP)
+# ==============================
 
-
-def select_action_random(env, agent_name: str, obs_dict):
-    """
-    PettingZoo action_space의 mask 샘플 기능 사용 (합법 수 중 랜덤).
-    """
-    mask = obs_dict["action_mask"]
-    return env.action_space(agent_name).sample(mask)
-
-
-def play_one_game(env, device, model_p0: Optional[ActorCritic],
-                  model_p1: Optional[ActorCritic],
-                  render: bool = False):
-    """
-    env: chess_v6 AEC env
-    model_p0: player_0에 사용할 모델 (None이면 랜덤)
-    model_p1: player_1에 사용할 모델 (None이면 랜덤)
-
-    return: winner_name: "player_0" / "player_1" / None (무승부)
-    """
-    env.reset()
+def play_game(game_idx, agent_model, opponent_model, opponent_type, device):
+    env = make_env()
+    
+    if game_idx % 2 == 0:
+        model_p0, type_p0 = agent_model, "model"
+        model_p1, type_p1 = opponent_model, opponent_type
+        agent_as_p0 = True
+    else:
+        model_p0, type_p0 = opponent_model, opponent_type
+        model_p1, type_p1 = agent_model, "model"
+        agent_as_p0 = False
+        
     rewards = {agent: 0.0 for agent in env.agents}
-
     for agent in env.agent_iter():
-        obs, reward, termination, truncation, info = env.last()
+        obs, reward, termination, truncation, _ = env.last()
         rewards[agent] += reward
-
         if termination or truncation:
             action = None
         else:
             if agent == "player_0":
-                if model_p0 is None:
-                    action = select_action_random(env, agent, obs)
-                else:
-                    action = select_action_model(model_p0, obs, device)
-            else:  # player_1
-                if model_p1 is None:
-                    action = select_action_random(env, agent, obs)
-                else:
-                    action = select_action_model(model_p1, obs, device)
-
+                cur_model, cur_type = model_p0, type_p0
+            else:
+                cur_model, cur_type = model_p1, type_p1
+                
+            if cur_type == "minimax":
+                action = select_action_minimax(env, obs)
+            elif cur_type == "model" and cur_model:
+                action = select_action_model(cur_model, obs, device)
+            else:
+                action = select_action_random(env, agent, obs)
         env.step(action)
 
-        if render:
-            env.render()
-
-    # 결과 판정: chess_v6는 set_game_result에서
-    # player_0 reward = result_val * 1, player_1 reward = result_val * -1
     r0 = rewards["player_0"]
-    if r0 > 0:
-        return "player_0"
-    elif r0 < 0:
-        return "player_1"
-    else:
-        return None  # draw
+    env.close()
 
-
-# ==============================
-#  메인: PPO vs 상대 모델 비교
-# ==============================
+    if r0 > 0: return 0 if agent_as_p0 else 1
+    elif r0 < 0: return 1 if agent_as_p0 else 0
+    else: return 2
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--agent-checkpoint",
-        type=str,
-        default="ppo_pettingzoo_chess_vector_final.pt",
-        help="우리 PPO 에이전트 checkpoint 경로",
-    )
-    parser.add_argument(
-        "--opponent-checkpoint",
-        type=str,
-        default=None,
-        help="비교할 opponent checkpoint 경로 (없으면 랜덤 정책)",
-    )
-    parser.add_argument(
-        "--n-games",
-        type=int,
-        default=20,
-        help="대국 횟수 (절반은 우리가 white, 절반은 black)",
-    )
-    parser.add_argument(
-        "--render",
-        action="store_true",
-        help="대국 진행 상황을 렌더링(창 띄우기)",
-    )
+    parser.add_argument("--agent-checkpoint", type=str, default="ppo_pettingzoo_chess_vector_final.pt")
+    parser.add_argument("--opponent-checkpoint", type=str, default="minimax")
+    parser.add_argument("--n-games", type=int, default=20)
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[INFO] Using device: {device}")
-
-    # 모델 로드
-    agent_model = build_model(device, args.agent_checkpoint)
-    if agent_model is None:
-        raise ValueError("agent-checkpoint가 필요합니다.")
-
-    opponent_model = build_model(device, args.opponent_checkpoint)
-    if opponent_model is None:
-        print("[INFO] Opponent: RANDOM policy (legal moves only).")
+    dist.init_process_group(backend="gloo")
+    
+    rank = dist.get_rank()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = dist.get_world_size()
+    
+    num_gpus = torch.cuda.device_count()
+    if num_gpus > 1:
+        device_id = local_rank % num_gpus
+        device = torch.device(f"cuda:{device_id}")
     else:
-        print(f"[INFO] Opponent model loaded from: {args.opponent_checkpoint}")
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    if rank == 0:
+        print(f"[INFO] Running with torchrun. World size: {world_size}")
+        print(f"[INFO] Rank 0 is using device: {device}")
 
-    # 평가용 env (렌더 여부는 arg에 따라)
-    render_mode = "human" if args.render else None
-    env = make_env(render_mode=render_mode)
+    agent_model = build_model(device, args.agent_checkpoint)
+    
+    opponent_type = "minimax"
+    opponent_model = None
+    if args.opponent_checkpoint != "minimax" and args.opponent_checkpoint is not None:
+        opponent_type = "model"
+        opponent_model = build_model(device, args.opponent_checkpoint)
 
-    a_wins = 0
-    b_wins = 0
-    draws = 0
+    my_games = [i for i in range(args.n_games) if i % world_size == rank]
+    local_stats = torch.zeros(3, dtype=torch.int, device=device) 
 
-    # n_games 번 플레이, 짝수/홀수 게임마다 색 바꿔줌
-    for game_idx in range(args.n_games):
-        # 짝수 게임: agent = player_0(white), opponent = player_1(black)
-        # 홀수 게임: agent = player_1(black), opponent = player_0(white)
-        if game_idx % 2 == 0:
-            model_p0 = agent_model
-            model_p1 = opponent_model
-            agent_as_p0 = True
-            color_str = "agent=WHITE, opponent=BLACK"
-        else:
-            model_p0 = opponent_model
-            model_p1 = agent_model
-            agent_as_p0 = False
-            color_str = "agent=BLACK, opponent=WHITE"
+    for idx in my_games:
+        res = play_game(idx, agent_model, opponent_model, opponent_type, device)
+        local_stats[res] += 1
 
-        print(f"\n[GAME {game_idx+1}/{args.n_games}] {color_str}")
+    dist.all_reduce(local_stats, op=dist.ReduceOp.SUM)
 
-        winner = play_one_game(
-            env,
-            device=device,
-            model_p0=model_p0,
-            model_p1=model_p1,
-            render=args.render,
-        )
+    if rank == 0:
+        a_wins = local_stats[0].item()
+        b_wins = local_stats[1].item()
+        draws = local_stats[2].item()
+        total = a_wins + b_wins + draws
+        
+        print("\n================ Evaluation Result ================")
+        print(f"Total Games   : {total}")
+        print(f"Agent wins    : {a_wins}")
+        print(f"Opponent wins : {b_wins}")
+        print(f"Draws         : {draws}")
+        if total > 0:
+            print(f"Agent Win Rate: {a_wins/total:.3f}")
+        print("==================================================")
 
-        if winner is None:
-            print("  -> Draw")
-            draws += 1
-        else:
-            print(f"  -> Winner: {winner}")
-            if winner == "player_0":
-                if agent_as_p0:
-                    a_wins += 1
-                    print("     (agent win)")
-                else:
-                    b_wins += 1
-                    print("     (opponent win)")
-            else:  # player_1
-                if agent_as_p0:
-                    b_wins += 1
-                    print("     (opponent win)")
-                else:
-                    a_wins += 1
-                    print("     (agent win)")
-
-    env.close()
-
-    print("\n================ Evaluation Result ================")
-    print(f"Agent wins    : {a_wins}")
-    print(f"Opponent wins : {b_wins}")
-    print(f"Draws         : {draws}")
-    total = a_wins + b_wins + draws
-    if total > 0:
-        print(f"Agent win rate vs opponent: {a_wins / total:.3f}")
-    print("==================================================")
-
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
