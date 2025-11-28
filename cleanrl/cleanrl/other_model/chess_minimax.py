@@ -7,6 +7,7 @@ import chess
 
 import chess
 import chess.engine
+import random
 
 # Stockfish 경로 (설치된 경로 확인 필요, 보통 /usr/games/stockfish 또는 /usr/bin/stockfish)
 # Mac Homebrew의 경우: "/opt/homebrew/bin/stockfish" 등
@@ -15,12 +16,16 @@ STOCKFISH_PATH = "/usr/games/stockfish"  # [수정 필요] 본인 경로 입력
 # 엔진 인스턴스 (전역으로 하나만 띄워두고 재사용 추천)
 engine = None
 
-def get_best_move_stockfish(board: chess.Board, time_limit=0.01):
+def get_best_move_stockfish_skill(board: chess.Board, time_limit=0.01, skill_level=0):
+    if skill_level <0 :
+        return select_action_random(board)
+
     global engine
     if engine is None:
         try:
             # SimpleEngine으로 프로세스 실행
             engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
+            engine.configure({"Skill Level": skill_level})
         except FileNotFoundError:
             print(f"[ERROR] Stockfish not found at {STOCKFISH_PATH}. Please install it.")
             return None
@@ -28,6 +33,13 @@ def get_best_move_stockfish(board: chess.Board, time_limit=0.01):
     # time_limit(초) 만큼만 생각하고 수를 둠 (0.01초면 매우 빠름)
     result = engine.play(board, chess.engine.Limit(time=time_limit))
     return result.move
+
+
+def select_action_random(board):
+    legal_moves = list(board.legal_moves)
+
+    return random.choice(legal_moves)
+
 
 def square_to_coord(s):
     col = s % 8
