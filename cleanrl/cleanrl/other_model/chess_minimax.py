@@ -1,20 +1,294 @@
 import chess
-
-# =============================================================================
-#  [PART 1] Action Encoding Logic
-#  (PettingZoo 호환을 위해 chess.Move를 int형 Action ID로 변환)
-# =============================================================================
-
-import chess
 import chess.engine
 import random
+import gym
+from gym import spaces
+import numpy as np
+import torch
+import torch.nn as nn # ActorCritic 재생성을 위해 필요
+from pettingzoo.classic import chess_v6
+import os
+import time
+import cv2
+import functools
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 
-# Stockfish 경로 (설치된 경로 확인 필요, 보통 /usr/games/stockfish 또는 /usr/bin/stockfish)
-# Mac Homebrew의 경우: "/opt/homebrew/bin/stockfish" 등
-STOCKFISH_PATH = "/usr/games/stockfish"  # [수정 필요] 본인 경로 입력
+# [주의] 이 코드가 실행되는 파일 내에 ActorCritic 클래스가 정의되어 있거나 import 되어 있어야 합니다.
+# from your_model_file import ActorCritic 
 
-# 엔진 인스턴스 (전역으로 하나만 띄워두고 재사용 추천)
-engine = None
+class ActorCritic(nn.Module):
+    def __init__(self, obs_shape, n_actions):
+        super().__init__()
+        self.h, self.w, self.c = obs_shape
+        self.network = nn.Sequential(
+            nn.Conv2d(self.c, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(256 * self.h * self.w, 1024),
+            nn.ReLU(),
+        )
+        self.actor = nn.Linear(1024, n_actions)
+        self.critic = nn.Linear(1024, 1)
+
+    # [Multi-GPU 수정] DataParallel은 forward 메서드를 자동으로 병렬화합니다.
+    # 기존 get_action_and_value의 로직을 forward로 이동합니다.
+    def forward(self, obs, action=None, action_mask=None):
+        # obs: (B, H, W, C) -> (B, C, H, W)
+        obs = obs.permute(0, 3, 1, 2)
+        hidden = self.network(obs)
+        logits = self.actor(hidden)
+
+        if action_mask is not None:
+            logits = logits.masked_fill(action_mask == 0, -1e9)
+            
+        dist = torch.distributions.Categorical(logits=logits)
+        if action is None:
+            action = dist.sample()
+
+        log_prob = dist.log_prob(action)
+        entropy = dist.entropy()
+        value = self.critic(hidden).squeeze(-1)
+        
+        return action, log_prob, entropy, value
+
+    # 기존 코드와의 호환성 및 단일 추론을 위해 남겨둠
+    def get_action_and_value(self, obs, action=None, action_mask=None):
+        return self.forward(obs, action, action_mask)
+
+    def get_value(self, obs):
+        obs = obs.permute(0, 3, 1, 2)
+        hidden = self.network(obs)
+        return self.critic(hidden).squeeze(-1)
+
+# =============================================================================
+#  [Helper Class] Stockfish Environment
+# =============================================================================
+class StockfishEvalEnv(gym.Env):
+    def __init__(self, stockfish_path, skill_level=0, render_mode=None):
+        super().__init__()
+        self.aec_env = chess_v6.env(render_mode=render_mode)
+        self.aec_env.reset()
+        
+        # Stockfish 엔진 인스턴스 생성
+        try:
+            self.engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            self.engine.configure({"Skill Level": skill_level})
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Stockfish path incorrect: {stockfish_path}")
+
+        raw_obs_space = self.aec_env.observation_space("player_0")["observation"]
+        self.observation_space = spaces.Box(low=0, high=1, shape=raw_obs_space.shape, dtype=np.float32)
+        self.action_space = self.aec_env.action_space("player_0")
+
+    def render(self):
+        return self.aec_env.render()
+
+    def play_match(self, agent, device, play_as_white=True, record_video=False):
+        self.aec_env.reset()
+        agent_player = "player_0" if play_as_white else "player_1"
+        frames = [] 
+
+        for agent_selection in self.aec_env.agent_iter():
+            observation, reward, termination, truncation, info = self.aec_env.last()
+            
+            if record_video:
+                frame = self.render()
+                if frame is not None: frames.append(frame)
+
+            if termination or truncation:
+                rewards = self.aec_env.rewards
+                agent_score = rewards[agent_player]
+                action = None
+                self.aec_env.step(action)
+                
+                result = 0
+                if agent_score > 0: result = 1    # Win
+                elif agent_score < 0: result = -1 # Loss
+                
+                return result, frames
+
+            if agent_selection == agent_player:
+                # === Agent Turn ===
+                obs_data = observation["observation"].copy() 
+                mask_data = observation["action_mask"].copy()
+                
+                obs_tensor = torch.tensor(obs_data, dtype=torch.float32, device=device).unsqueeze(0)
+                mask_tensor = torch.tensor(mask_data, dtype=torch.float32, device=device).unsqueeze(0)
+                
+                with torch.no_grad():
+                    # 병렬 워커에서는 DDP나 module이 없을 수 있으므로 체크
+                    if hasattr(agent, 'module'):
+                        action_idx, _, _, _ = agent.module.forward(obs_tensor, action_mask=mask_tensor)
+                    else:
+                        action_idx, _, _, _ = agent.forward(obs_tensor, action_mask=mask_tensor)
+                
+                action = action_idx.item()
+            else:
+                # === Stockfish Turn ===
+                board = self.aec_env.unwrapped.board
+                limit = chess.engine.Limit(time=0.05)
+                result_engine = self.engine.play(board, limit)
+                
+                if result_engine.move is None:
+                    action = self.aec_env.action_space(agent_selection).sample(observation["action_mask"])
+                else:
+                    is_black = (agent_selection == "player_1")
+                    try:
+                        # encode_move 함수가 scope 내에 있어야 함
+                        from other_model.chess_minimax import encode_move
+                        action = encode_move(result_engine.move, should_mirror=is_black)
+                    except:
+                        action = self.aec_env.action_space(agent_selection).sample(observation["action_mask"])
+
+            self.aec_env.step(action)
+
+        return 0, frames
+
+    def close(self):
+        if hasattr(self, 'engine'):
+            self.engine.quit()
+        self.aec_env.close()
+
+# =============================================================================
+#  [Parallel Worker Function]
+#  이 함수는 각 프로세스(CPU 코어)에서 독립적으로 실행됩니다.
+# =============================================================================
+def run_eval_worker(game_idx, config, model_state_dict, obs_shape, n_actions):
+    """
+    단일 게임을 수행하는 워커 함수
+    """
+    # 1. 각 프로세스마다 별도의 CPU Device 사용 (CUDA Context 충돌 방지)
+    device = torch.device("cpu")
+    
+    # 2. 모델 재생성 및 가중치 로드
+    # (ActorCritic 클래스가 이 파일 내에 있거나 import 가능해야 함)
+    local_agent = ActorCritic(obs_shape, n_actions).to(device)
+    local_agent.load_state_dict(model_state_dict)
+    local_agent.eval()
+
+    # 3. 환경 생성
+    try:
+        env = StockfishEvalEnv(config.stockfish_path, skill_level=config.stockfish_eval_skill)
+    except Exception as e:
+        print(f"[Worker Error] Failed to init Env: {e}")
+        return 0 # 에러 시 무승부 처리 또는 예외 발생
+
+    # 4. 게임 진행
+    play_as_white = (game_idx % 2 == 0)
+    try:
+        # 비디오 녹화는 워커에서 하지 않음 (False)
+        result, _ = env.play_match(local_agent, device, play_as_white=play_as_white, record_video=False)
+    except Exception as e:
+        print(f"[Worker Error] Game {game_idx} failed: {e}")
+        result = 0
+    finally:
+        env.close()
+
+    return result
+
+# =============================================================================
+#  [Main Evaluation Function]
+# =============================================================================
+def evaluate_vs_stockfish(agent, device, config, num_games=10, step_count=0):
+    
+    # -----------------------------------------------------
+    # 1. 첫 번째 게임: 비디오 녹화를 위해 메인 프로세스에서 실행
+    # -----------------------------------------------------
+    print(f"[EVAL] Playing video match (Game 1/{num_games})...")
+    
+    # 영상 저장을 위한 Eval Env
+    video_env = StockfishEvalEnv(
+        config.stockfish_path, 
+        skill_level=config.stockfish_eval_skill, 
+        render_mode="rgb_array"
+    )
+    
+    # DDP 등으로 감싸진 모델의 원본을 가져오기 (state_dict 추출용)
+    raw_model = agent.module if hasattr(agent, "module") else agent
+    raw_model.eval()
+
+    # 첫 번째 판 실행
+    video_result, frames = video_env.play_match(
+        raw_model, device, play_as_white=True, record_video=True
+    )
+    video_env.close()
+    
+    results = [video_result] # 결과 리스트 시작
+
+    # 영상 저장 (OpenCV)
+    video_dir = f"videos/{config.exp_name}"
+    os.makedirs(video_dir, exist_ok=True)
+    
+    if frames:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        outcome = "Win" if video_result == 1 else "Loss" if video_result == -1 else "Draw"
+        filename = f"{video_dir}/step_{step_count}_White_{outcome}.mp4"
+        
+        try:
+            height, width, layers = frames[0].shape
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+            out = cv2.VideoWriter(filename, fourcc, 2.0, (width, height))
+            for frame in frames:
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                out.write(frame_bgr)
+            out.release()
+            print(f"[VIDEO] Saved to {filename}")
+        except Exception as e:
+            print(f"[ERROR] Video save failed: {e}")
+
+    # -----------------------------------------------------
+    # 2. 나머지 게임: 멀티프로세싱으로 병렬 실행
+    # -----------------------------------------------------
+    remaining_games = num_games - 1
+    if remaining_games > 0:
+        print(f"[EVAL] Playing {remaining_games} games in parallel...")
+        
+        # 모델의 가중치를 CPU로 이동 (프로세스 간 공유를 위해)
+        cpu_state_dict = {k: v.cpu() for k, v in raw_model.state_dict().items()}
+        
+        # 모델 구조 정보 추출 (ActorCritic 재생성용)
+        # obs_shape=(8,8,111), n_actions=4672 등
+        obs_shape = (video_env.aec_env.observation_space("player_0")["observation"].shape[0],
+                     video_env.aec_env.observation_space("player_0")["observation"].shape[1],
+                     video_env.aec_env.observation_space("player_0")["observation"].shape[2])
+        n_actions = video_env.aec_env.action_space("player_0").n
+
+        # 워커 함수에 전달할 고정 인자들을 묶음 (partial)
+        worker_fn = functools.partial(
+            run_eval_worker, 
+            config=config, 
+            model_state_dict=cpu_state_dict,
+            obs_shape=obs_shape,
+            n_actions=n_actions
+        )
+
+        # 게임 인덱스 리스트 (1부터 시작)
+        game_indices = range(1, num_games)
+
+        # CPU 코어 수만큼 프로세스 풀 생성 (너무 많으면 오버헤드 발생, 보통 cpu_count 사용)
+        num_workers = min(multiprocessing.cpu_count(), remaining_games)
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # 병렬 실행 및 결과 수집
+            parallel_results = list(executor.map(worker_fn, game_indices))
+        
+        results.extend(parallel_results)
+
+    # -----------------------------------------------------
+    # 3. 결과 집계
+    # -----------------------------------------------------
+    agent.train() # 다시 학습 모드로 전환
+    
+    win_rate = results.count(1) / num_games
+    draw_rate = results.count(0) / num_games
+    loss_rate = results.count(-1) / num_games
+    
+    return win_rate, draw_rate, loss_rate
 
 def get_best_move_stockfish_skill(board: chess.Board, time_limit=0.01, skill_level=0):
     if skill_level <0 :

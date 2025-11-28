@@ -16,9 +16,8 @@ import wandb
 import chess
 from pettingzoo.classic import chess_v6
 
-# [중요] 기존에 사용하시던 모듈이 있다고 가정합니다.
-# 만약 없다면, 아래 PIECE_VALUES와 유사한 로직이 필요합니다.
-from other_model.chess_minimax import PIECE_VALUES
+# 기존 모듈 임포트 유지
+from other_model.chess_minimax import PIECE_VALUES, evaluate_vs_stockfish
 
 # ==========================================
 # 1. Model Definition (Actor-Critic)
@@ -26,7 +25,6 @@ from other_model.chess_minimax import PIECE_VALUES
 class ActorCritic(nn.Module):
     def __init__(self, obs_shape, n_actions):
         super().__init__()
-        # PettingZoo Chess v6는 (8, 8, 111) 형태의 관측 공간을 가짐
         self.h, self.w, self.c = obs_shape
         self.network = nn.Sequential(
             nn.Conv2d(self.c, 64, kernel_size=3, stride=1, padding=1),
@@ -42,18 +40,15 @@ class ActorCritic(nn.Module):
         self.actor = nn.Linear(1024, n_actions)
         self.critic = nn.Linear(1024, 1)
 
-    def get_value(self, obs):
-        obs = obs.permute(0, 3, 1, 2) # (B, H, W, C) -> (B, C, H, W)
-        hidden = self.network(obs)
-        return self.critic(hidden).squeeze(-1)
-
-    def get_action_and_value(self, obs, action=None, action_mask=None):
+    # [Multi-GPU 수정] DataParallel은 forward 메서드를 자동으로 병렬화합니다.
+    # 기존 get_action_and_value의 로직을 forward로 이동합니다.
+    def forward(self, obs, action=None, action_mask=None):
+        # obs: (B, H, W, C) -> (B, C, H, W)
         obs = obs.permute(0, 3, 1, 2)
         hidden = self.network(obs)
         logits = self.actor(hidden)
 
         if action_mask is not None:
-            # 불가능한 수는 매우 작은 값으로 마스킹
             logits = logits.masked_fill(action_mask == 0, -1e9)
             
         dist = torch.distributions.Categorical(logits=logits)
@@ -63,17 +58,22 @@ class ActorCritic(nn.Module):
         log_prob = dist.log_prob(action)
         entropy = dist.entropy()
         value = self.critic(hidden).squeeze(-1)
+        
         return action, log_prob, entropy, value
+
+    # 기존 코드와의 호환성 및 단일 추론을 위해 남겨둠
+    def get_action_and_value(self, obs, action=None, action_mask=None):
+        return self.forward(obs, action, action_mask)
+
+    def get_value(self, obs):
+        obs = obs.permute(0, 3, 1, 2)
+        hidden = self.network(obs)
+        return self.critic(hidden).squeeze(-1)
 
 # ==========================================
 # 2. Symmetric Self-Play Environment
 # ==========================================
 class ChessSymmetricEnv(gym.Env):
-    """
-    이 환경은 '나 자신'과의 대결을 위해 설계되었습니다.
-    step()을 호출하면 턴이 변경됩니다 (White -> Black -> White ...).
-    에이전트는 매 스텝마다 현재 턴 플레이어의 관점에서 최적의 수를 둡니다.
-    """
     metadata = {"render_modes": ["human", "ansi", "rgb_array"], "name": "ChessSymmetricEnv"}
 
     def __init__(self, render_mode=None):
@@ -82,8 +82,6 @@ class ChessSymmetricEnv(gym.Env):
         self.aec_env = chess_v6.env(render_mode=render_mode)
         self.aec_env.reset()
         
-        # Observation & Action Space 정의
-        # Player_0(White) 기준으로 Space를 가져옴
         raw_obs_space = self.aec_env.observation_space("player_0")["observation"]
         self.observation_space = spaces.Box(
             low=0, high=1, shape=raw_obs_space.shape, dtype=np.float32
@@ -93,22 +91,6 @@ class ChessSymmetricEnv(gym.Env):
         self.current_agent = "player_0"
         self.step_count = 0
 
-    def _get_board_value(self, agent_id):
-        """보상 shaping을 위한 간단한 기물 점수 계산"""
-        board = self.aec_env.unwrapped.board
-        value = 0.0
-        # PIECE_VALUES = {chess.PAWN: 1, chess.KNIGHT: 3, ...}
-        for piece in board.piece_map().values():
-            score = PIECE_VALUES.get(piece.piece_type, 0)
-            if piece.color == chess.WHITE:
-                value += score
-            else:
-                value -= score
-        
-        # agent_id 관점에서 점수 반환
-        if agent_id == "player_0": return value  # White
-        else: return -value                      # Black
-
     def reset(self, seed=None, options=None):
         self.aec_env.reset(seed=seed)
         self.current_agent = self.aec_env.agent_selection
@@ -117,44 +99,30 @@ class ChessSymmetricEnv(gym.Env):
         obs_dict = self.aec_env.observe(self.current_agent)
         obs = obs_dict["observation"].astype(np.float32)
         mask = obs_dict["action_mask"].astype(np.float32)
-        
         return obs, {"action_mask": mask}
 
     def step(self, action):
-        # 1. 현재 플레이어의 Action 실행
         self.aec_env.step(int(action))
         self.step_count += 1
         
-        # 2. 종료 조건 확인
         terminations = self.aec_env.terminations
         truncations = self.aec_env.truncations
         
-        # 누군가 이겼거나 비겼다면
         if any(terminations.values()) or any(truncations.values()):
-            # 승패 판정
-            # 방금 수를 둔 플레이어(self.current_agent)가 이겼는지 확인
             rewards = self.aec_env.rewards
             my_reward = rewards[self.current_agent]
             
-            # 종료 시에는 다음 관측값이 의미가 없으므로 0으로 채움
             dummy_obs = np.zeros(self.observation_space.shape, dtype=np.float32)
             dummy_mask = np.ones(self.action_space.n, dtype=np.float32)
             
             return dummy_obs, float(my_reward), True, False, {"action_mask": dummy_mask, "winner": self.current_agent}
 
-        # 3. 게임이 안 끝났으면 -> 다음 플레이어로 턴 넘어감
         self.current_agent = self.aec_env.agent_selection
-        
         obs_dict = self.aec_env.observe(self.current_agent)
         next_obs = obs_dict["observation"].astype(np.float32)
         next_mask = obs_dict["action_mask"].astype(np.float32)
         
-        # [중요] Self-Play 보상 설계
-        # 게임이 진행 중일 때의 보상은 0이 기본이지만, 
-        # 학습 가속화를 위해 약간의 Material Advantage(기물 점수)를 줄 수 있음.
-        # 단, Zero-Sum 게임이므로 신중해야 함. 여기서는 0으로 둠.
         step_reward = 0.0
-        
         return next_obs, step_reward, False, False, {"action_mask": next_mask}
 
     def render(self):
@@ -169,11 +137,11 @@ class ChessSymmetricEnv(gym.Env):
 @dataclass
 class PPOConfig:
     exp_name: str = "ppo_chess_selfplay_gpu"
-    total_timesteps: int = 50_000_000
+    total_timesteps: int = 300_000_000
     learning_rate: float = 2.5e-4
-    num_steps: int = 1024       # 롤아웃 길이 증가
-    num_envs: int = 64          # GPU 배치 효율을 위해 환경 개수 증가 (CPU 코어 감안하여 조절)
-    minibatch_size: int = 2048  # 배치 사이즈 증가
+    num_steps: int = 1024
+    num_envs: int = 64
+    minibatch_size: int = 2048
     update_epochs: int = 4
     
     seed: int = 42
@@ -187,46 +155,66 @@ class PPOConfig:
     logging: bool = True
     resume: str = None
 
+    # Stockfish 경로 확인 필요 (User 환경에 맞게)
+    stockfish_path: str = "/usr/games/stockfish"
+    stockfish_eval_skill: int = 0
+    eval_interval: int = 50
+    eval_games: int = 16
+
 # ==========================================
-# 4. Helper Functions (Env Setup)
+# 4. Helper Functions
 # ==========================================
 def make_single_env(seed_offset=0):
     def _init():
         env = ChessSymmetricEnv(render_mode=None)
-        # Gym Wrapper로 감싸서 호환성 확보
         env = gym.wrappers.RecordEpisodeStatistics(env) 
         env.reset(seed=seed_offset)
         return env
     return _init
 
 def make_vector_env(num_envs):
-    # AsyncVectorEnv를 사용하여 멀티프로세싱 병렬화
     return AsyncVectorEnv([make_single_env(i) for i in range(num_envs)])
 
 # ==========================================
 # 5. Main Training Loop
 # ==========================================
 def train(config: PPOConfig):
+    # [Multi-GPU 수정] GPU 설정
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Training Device: {device}")
     
+    if torch.cuda.device_count() > 1:
+        print(f"[INFO] Using {torch.cuda.device_count()} GPUs for training!")
+    
     if config.logging:
-        wandb.init(project="Chess-RL-SelfPlay", config=config.__dict__, name=config.exp_name)
+        wandb.init(project="Reinforcement-Learning", config=config.__dict__, name=config.exp_name)
 
-    # Vector Environment 생성
     env = make_vector_env(config.num_envs)
     
     obs_shape = env.single_observation_space.shape
     n_actions = env.single_action_space.n
     
     agent = ActorCritic(obs_shape, n_actions).to(device)
+    
+    # [Multi-GPU 수정] 모델 로딩 시 분기 처리
     if config.resume:
         print(f"[INFO] Loading model from {config.resume}")
-        agent.load_state_dict(torch.load(config.resume, map_location=device))
+        checkpoint = torch.load(config.resume, map_location=device)
         
+        # DataParallel로 저장된 모델(module. prefix)을 일반 모델에 로드할 때 처리
+        # 만약 저장된 키가 'module.'로 시작하면 제거하고 로드
+        new_state_dict = {}
+        for k, v in checkpoint.items():
+            name = k.replace("module.", "") if k.startswith("module.") else k
+            new_state_dict[name] = v
+        agent.load_state_dict(new_state_dict)
+
+    # [Multi-GPU 수정] DataParallel 래핑
+    if torch.cuda.device_count() > 1:
+        agent = nn.DataParallel(agent)
+
     optimizer = optim.Adam(agent.parameters(), lr=config.learning_rate, eps=1e-5)
 
-    # Buffer Initialization
     obs_buf = torch.zeros((config.num_steps, config.num_envs) + obs_shape, dtype=torch.float32, device=device)
     masks_buf = torch.zeros((config.num_steps, config.num_envs, n_actions), dtype=torch.float32, device=device)
     actions_buf = torch.zeros((config.num_steps, config.num_envs), dtype=torch.long, device=device)
@@ -238,7 +226,6 @@ def train(config: PPOConfig):
     global_step = 0
     num_updates = config.total_timesteps // (config.num_steps * config.num_envs)
 
-    # Initial Observation
     next_obs_np, info = env.reset()
     next_obs = torch.tensor(next_obs_np, dtype=torch.float32, device=device)
     next_mask = torch.tensor(info["action_mask"], dtype=torch.float32, device=device)
@@ -255,25 +242,21 @@ def train(config: PPOConfig):
             dones_buf[step] = next_done
 
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs, action_mask=next_mask)
+                # [Multi-GPU 수정] agent(x) 호출 -> forward() 실행 -> 자동 병렬화
+                action, logprob, _, value = agent(next_obs, action_mask=next_mask)
                 values_buf[step] = value
             
             actions_buf[step] = action
             logprobs_buf[step] = logprob
 
-            # Step Environment (CPU 병렬 처리)
-            # 여기서는 Stockfish를 기다리지 않으므로 매우 빠름
             real_next_obs, rewards, terminated, truncated, infos = env.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
             
             rewards_buf[step] = torch.tensor(rewards, dtype=torch.float32, device=device)
-            
-            # 다음 상태 업데이트
             next_obs = torch.tensor(real_next_obs, dtype=torch.float32, device=device)
             next_mask = torch.tensor(infos["action_mask"], dtype=torch.float32, device=device)
             next_done = torch.tensor(done, dtype=torch.float32, device=device)
 
-            # Logging (에피소드 끝난 경우)
             if "final_info" in infos:
                 for i, info_item in enumerate(infos["final_info"]):
                     if info_item and "episode" in info_item:
@@ -284,9 +267,17 @@ def train(config: PPOConfig):
                                 "global_step": global_step
                             })
 
-        # --- 2. GAE (Generalized Advantage Estimation) ---
+        # --- 2. GAE ---
         with torch.no_grad():
-            next_value = agent.get_value(next_obs)
+            # [Multi-GPU Note] get_value는 DataParallel로 자동 분산되지 않으므로(forward가 아님)
+            # 메인 GPU에서 실행되거나, agent.module.get_value를 호출해야 합니다.
+            # 하지만 여기서는 배치가 작으므로(num_envs) 그냥 실행해도 무방합니다.
+            # DataParallel 객체는 forward 외의 메서드를 바로 호출할 수 없으므로 module 접근 필요.
+            if isinstance(agent, nn.DataParallel):
+                next_value = agent.module.get_value(next_obs)
+            else:
+                next_value = agent.get_value(next_obs)
+                
             advantages = torch.zeros_like(rewards_buf).to(device)
             lastgaelam = 0
             for t in reversed(range(config.num_steps)):
@@ -302,7 +293,7 @@ def train(config: PPOConfig):
             
             returns = advantages + values_buf
 
-        # --- 3. PPO Update ---
+        # --- 3. PPO Update (Multi-GPU Benefit Here) ---
         b_obs = obs_buf.reshape((-1,) + obs_shape)
         b_logprobs = logprobs_buf.reshape(-1)
         b_actions = actions_buf.reshape(-1)
@@ -319,7 +310,8 @@ def train(config: PPOConfig):
                 end = start + config.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                # [Multi-GPU 수정] forward 호출 (자동 병렬화)
+                _, newlogprob, entropy, newvalue = agent(
                     b_obs[mb_inds], 
                     action=b_actions[mb_inds], 
                     action_mask=b_masks[mb_inds]
@@ -329,15 +321,12 @@ def train(config: PPOConfig):
                 ratio = logratio.exp()
 
                 mb_advantages = b_advantages[mb_inds]
-                # Normalize advantages
                 mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Policy Loss
                 pg_loss1 = -mb_advantages * ratio
                 pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - config.clip_coef, 1 + config.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value Loss
                 newvalue = newvalue.view(-1)
                 v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
@@ -348,7 +337,7 @@ def train(config: PPOConfig):
                 nn.utils.clip_grad_norm_(agent.parameters(), config.max_grad_norm)
                 optimizer.step()
 
-        if config.logging and update % 10 == 0:
+        if config.logging:
             wandb.log({
                 "losses/policy_loss": pg_loss.item(),
                 "losses/value_loss": v_loss.item(),
@@ -356,12 +345,48 @@ def train(config: PPOConfig):
                 "global_step": global_step
             })
 
-        # --- 4. Video Recording (Optional) ---
-        if update % 50 == 0:
+        # --- 4. Save & Eval ---
+        if update % 100 == 0:
             save_path = f"models/{config.exp_name}_{update}.pt"
             os.makedirs("models", exist_ok=True)
-            torch.save(agent.state_dict(), save_path)
-            # 비디오 녹화는 별도 함수로 호출 (위에서 정의한 ChessSelfPlayEnv 사용)
+            # [Multi-GPU 수정] 저장 시 module의 state_dict 저장 (Load 호환성 위함)
+            model_to_save = agent.module if isinstance(agent, nn.DataParallel) else agent
+            torch.save(model_to_save.state_dict(), save_path)
+            print(f"[INFO] Saved model to {save_path}")
+
+            
+        
+        if update % config.eval_interval == 0:
+            eval_agent = agent.module if isinstance(agent, nn.DataParallel) else agent
+            
+            try:
+                win, draw, loss = evaluate_vs_stockfish(
+                    eval_agent,
+                    device, 
+                    config, 
+                    num_games=config.eval_games,
+                    step_count=global_step 
+                )
+                
+                print(f"[EVAL] Result - Win: {win*100:.1f}%, Draw: {draw*100:.1f}%, Loss: {loss*100:.1f}%")
+                
+                if config.logging:
+                    wandb.log({
+                        "eval/win_rate": win, 
+                        "eval/draw_rate": draw, 
+                        "eval/loss_rate": loss, 
+                        "global_step": global_step
+                    })
+                
+                if win + draw == 1.0:
+                    print("[EVAL] Perfect performance against Stockfish achieved! stockfish_eval_skill increased.")
+                    config.stockfish_eval_skill = min(config.stockfish_eval_skill + 1, 20)
+                    
+                    
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"[ERROR] Eval failed: {e}")
 
     env.close()
     if config.logging: wandb.finish()
