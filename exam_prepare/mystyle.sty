@@ -1,0 +1,29 @@
+\usepackage{amsmath}
+% use UTF8 encoding
+\usepackage[utf8]{inputenc}
+% use KoTeX package for Korean
+\usepackage{kotex}
+\usepackage[a4paper,left=20mm,right=20mm,top=20mm,bottom=20mm]{geometry}
+
+\usepackage{graphicx}
+
+\usepackage{hyperref}
+\usepackage{setspace}
+\usepackage{caption}
+\usepackage{tabularx}
+\usepackage{minted}
+\usepackage{amsmath}
+\usepackage{longdivision}
+\usepackage{array, booktabs}
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\usepackage{indentfirst}
+\usepackage{amsfonts}
+% #1 is image location, #2 is caption
+\newcommand{\figureInEnumerateW}[3]{\begin{minipage}[h]{\linewidth}
+        \centering \includegraphics[width = #3\textwidth]{#1} \captionof{figure}{#2} \end{minipage}}
+\newcommand{\figureInEnumerateH}[3]{\begin{minipage}[h]{\linewidth}
+        \centering \includegraphics[height = #3\textheight]{#1} \captionof{figure}{#2} \end{minipage}}
+
+\newcommand{\twofigureInEnumerateW}[5]{\begin{minipage}[h]{\linewidth}
+         \includegraphics[width = #4\textwidth]{#1} \includegraphics[width = #5\textwidth]{#2} \captionof{figure}{#3} \end{minipage}}
