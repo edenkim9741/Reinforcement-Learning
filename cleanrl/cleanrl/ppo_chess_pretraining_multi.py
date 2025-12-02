@@ -760,8 +760,8 @@ def train(config: PPOConfig):
                         "eval/draw_rate": draw, 
                         "eval/loss_rate": loss, 
                         "eval/stockfish_time_limit": config.stockfish_eval_time_limit,
+                        "eval/stockfish_skill": config.stockfish_eval_skill
                         "global_step": global_step,
-                        "stockfish_skill": config.stockfish_eval_skill
                     })
                 
                 if win + draw == 1.0:

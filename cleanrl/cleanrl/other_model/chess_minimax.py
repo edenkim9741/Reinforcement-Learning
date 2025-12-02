@@ -310,7 +310,7 @@ def evaluate_vs_stockfish(agent, device, config, num_games=10, update=0):
         game_indices = range(1, num_games)
 
         # CPU 코어 수만큼 프로세스 풀 생성 (너무 많으면 오버헤드 발생, 보통 cpu_count 사용)
-        num_workers = min(multiprocessing.cpu_count(), 8)
+        num_workers = min(multiprocessing.cpu_count(), 4)
         
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             # 병렬 실행 및 결과 수집
