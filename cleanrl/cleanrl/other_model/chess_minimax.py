@@ -13,6 +13,7 @@ import cv2
 import functools
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
+import torch.multiprocessing as mp
 
 # [주의] 이 코드가 실행되는 파일 내에 ActorCritic 클래스가 정의되어 있거나 import 되어 있어야 합니다.
 # from your_model_file import ActorCritic 
