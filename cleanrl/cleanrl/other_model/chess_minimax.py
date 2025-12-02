@@ -17,61 +17,99 @@ import multiprocessing
 # [주의] 이 코드가 실행되는 파일 내에 ActorCritic 클래스가 정의되어 있거나 import 되어 있어야 합니다.
 # from your_model_file import ActorCritic 
 
-class ActorCritic(nn.Module):
-    def __init__(self, obs_shape, n_actions):
+# ==========================================
+# 2. Model (Optimized)
+# ==========================================
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        identity = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out.add_(identity)
+        return self.relu(out)
+
+class ChessAgent(nn.Module):
+    def __init__(self, obs_shape, n_actions, num_res_blocks=4, channels=128):
         super().__init__()
         self.h, self.w, self.c = obs_shape
-        self.network = nn.Sequential(
-            nn.Conv2d(self.c, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(256 * self.h * self.w, 1024),
-            nn.ReLU(),
+        
+        self.start_block = nn.Sequential(
+            nn.Conv2d(self.c, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
         )
-        self.actor = nn.Linear(1024, n_actions)
-        self.critic = nn.Linear(1024, 1)
+        
+        self.backbone = nn.Sequential(*[ResBlock(channels) for _ in range(num_res_blocks)])
+        
+        self.actor_head = nn.Sequential(
+            nn.Conv2d(channels, 32, 1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(32 * self.h * self.w, n_actions)
+        )
+        
+        self.critic_head = nn.Sequential(
+            nn.Conv2d(channels, 16, 1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(16 * self.h * self.w, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 1)
+        )
 
-    # [Multi-GPU 수정] DataParallel은 forward 메서드를 자동으로 병렬화합니다.
-    # 기존 get_action_and_value의 로직을 forward로 이동합니다.
+    def get_value(self, x):
+        x = x.permute(0, 3, 1, 2)
+        x = self.start_block(x)
+        x = self.backbone(x)
+        return self.critic_head(x)
+
     def forward(self, obs, action=None, action_mask=None):
-        # obs: (B, H, W, C) -> (B, C, H, W)
-        obs = obs.permute(0, 3, 1, 2)
-        hidden = self.network(obs)
-        logits = self.actor(hidden)
+        x = obs.permute(0, 3, 1, 2)
+        x = self.start_block(x)
+        x = self.backbone(x)
+        
+        logits = self.actor_head(x)
+        value = self.critic_head(x).squeeze(-1)
 
         if action_mask is not None:
-            logits = logits.masked_fill(action_mask == 0, -1e9)
-            
+            # === [Safety Fix] ===
+            # 어떤 행(sample)의 action_mask가 모두 0이라면(둘 수 있는 수가 없는 경우),
+            # 모델이 죽지 않도록 임의로 첫 번째 행동(0번 인덱스)을 유효하게 만듭니다.
+            # (이 데이터는 어차피 done=True라서 학습 가치 계산 시 무시되거나 끊깁니다)
+            is_all_invalid = action_mask.sum(dim=1) == 0
+            if is_all_invalid.any():
+                # 원본 마스크를 건드리지 않기 위해 복사
+                action_mask = action_mask.clone()
+                action_mask[is_all_invalid, 0] = 1.0
+
+            # 유효하지 않은 행동의 확률을 -1e9로 낮춤 (마스킹)
+            logits = torch.where(action_mask.bool(), logits, torch.tensor(-1e9, device=logits.device))
+
         dist = torch.distributions.Categorical(logits=logits)
+        
         if action is None:
             action = dist.sample()
 
-        log_prob = dist.log_prob(action)
-        entropy = dist.entropy()
-        value = self.critic(hidden).squeeze(-1)
-        
-        return action, log_prob, entropy, value
-
-    # 기존 코드와의 호환성 및 단일 추론을 위해 남겨둠
-    def get_action_and_value(self, obs, action=None, action_mask=None):
-        return self.forward(obs, action, action_mask)
-
-    def get_value(self, obs):
-        obs = obs.permute(0, 3, 1, 2)
-        hidden = self.network(obs)
-        return self.critic(hidden).squeeze(-1)
+        return action, dist.log_prob(action), dist.entropy(), value
 
 # =============================================================================
 #  [Helper Class] Stockfish Environment
 # =============================================================================
 class StockfishEvalEnv(gym.Env):
-    def __init__(self, stockfish_path, skill_level=0, render_mode=None):
+    def __init__(self, stockfish_path, skill_level=0, time_limit=0.05, render_mode=None):
         super().__init__()
         self.aec_env = chess_v6.env(render_mode=render_mode)
+        self.time_limit = time_limit
         self.aec_env.reset()
         
         # Stockfish 엔진 인스턴스 생성
@@ -131,7 +169,7 @@ class StockfishEvalEnv(gym.Env):
             else:
                 # === Stockfish Turn ===
                 board = self.aec_env.unwrapped.board
-                limit = chess.engine.Limit(time=0.05)
+                limit = chess.engine.Limit(time=self.time_limit)
                 result_engine = self.engine.play(board, limit)
                 
                 if result_engine.move is None:
@@ -167,13 +205,13 @@ def run_eval_worker(game_idx, config, model_state_dict, obs_shape, n_actions):
     
     # 2. 모델 재생성 및 가중치 로드
     # (ActorCritic 클래스가 이 파일 내에 있거나 import 가능해야 함)
-    local_agent = ActorCritic(obs_shape, n_actions).to(device)
+    local_agent = ChessAgent(obs_shape, n_actions).to(device)
     local_agent.load_state_dict(model_state_dict)
     local_agent.eval()
 
     # 3. 환경 생성
     try:
-        env = StockfishEvalEnv(config.stockfish_path, skill_level=config.stockfish_eval_skill)
+        env = StockfishEvalEnv(config.stockfish_path, skill_level=config.stockfish_eval_skill, time_limit=config.stockfish_eval_time_limit)
     except Exception as e:
         print(f"[Worker Error] Failed to init Env: {e}")
         return 0 # 에러 시 무승부 처리 또는 예외 발생
@@ -194,7 +232,7 @@ def run_eval_worker(game_idx, config, model_state_dict, obs_shape, n_actions):
 # =============================================================================
 #  [Main Evaluation Function]
 # =============================================================================
-def evaluate_vs_stockfish(agent, device, config, num_games=10, step_count=0):
+def evaluate_vs_stockfish(agent, device, config, num_games=10, update=0):
     
     # -----------------------------------------------------
     # 1. 첫 번째 게임: 비디오 녹화를 위해 메인 프로세스에서 실행
@@ -205,6 +243,7 @@ def evaluate_vs_stockfish(agent, device, config, num_games=10, step_count=0):
     video_env = StockfishEvalEnv(
         config.stockfish_path, 
         skill_level=config.stockfish_eval_skill, 
+        time_limit=config.stockfish_eval_time_limit,
         render_mode="rgb_array"
     )
     
@@ -227,7 +266,7 @@ def evaluate_vs_stockfish(agent, device, config, num_games=10, step_count=0):
     if frames:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         outcome = "Win" if video_result == 1 else "Loss" if video_result == -1 else "Draw"
-        filename = f"{video_dir}/step_{step_count}_White_{outcome}.mp4"
+        filename = f"{video_dir}/step_{update}_White_{outcome}.mp4"
         
         try:
             height, width, layers = frames[0].shape
@@ -271,7 +310,7 @@ def evaluate_vs_stockfish(agent, device, config, num_games=10, step_count=0):
         game_indices = range(1, num_games)
 
         # CPU 코어 수만큼 프로세스 풀 생성 (너무 많으면 오버헤드 발생, 보통 cpu_count 사용)
-        num_workers = min(multiprocessing.cpu_count(), remaining_games)
+        num_workers = min(multiprocessing.cpu_count(), 8)
         
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             # 병렬 실행 및 결과 수집
@@ -290,7 +329,10 @@ def evaluate_vs_stockfish(agent, device, config, num_games=10, step_count=0):
     
     return win_rate, draw_rate, loss_rate
 
-def get_best_move_stockfish_skill(board: chess.Board, time_limit=0.01, skill_level=0):
+engine = None
+STOCKFISH_PATH = "/usr/games/stockfish"  # Stockfish 실행
+
+def get_best_move_stockfish_skill(board: chess.Board, time_limit=0, skill_level=0):
     if skill_level <0 :
         return select_action_random(board)
 

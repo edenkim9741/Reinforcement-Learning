@@ -6,10 +6,11 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import chess
+import chess.engine
 from pettingzoo.classic import chess_v6
 
 # [NEW] 공통 모듈 임포트
-from other_model.chess_minimax import get_best_move_minimax, encode_move, get_best_move_stockfish
+from other_model.chess_minimax import get_best_move_minimax, encode_move, get_best_move_stockfish_skill
 
 # ==============================
 #  Helpers & Model
@@ -23,7 +24,7 @@ def select_action_minimax(env, obs_dict, use_stockfish=False):
     
     # Eval할 때는 보통 조금 더 똑똑한 상대를 원할 수 있으므로 depth=2
     if use_stockfish:
-        best_move = get_best_move_stockfish(board, time_limit=0.01)
+        best_move = get_best_move_stockfish_skill(board, skill_level=0)
     else:
         best_move = get_best_move_minimax(board, depth=2)
     
@@ -180,7 +181,7 @@ def main():
 
     agent_model = build_model(device, args.agent_checkpoint)
     
-    opponent_types = ("minimax", "stockfish")
+    opponent_types = ("minimax", "stockfish", "random")
     opponent_model = None
     opponent_type = None
     if args.opponent_checkpoint not in opponent_types and args.opponent_checkpoint is not None:

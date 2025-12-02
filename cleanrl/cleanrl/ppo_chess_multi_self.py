@@ -40,7 +40,6 @@ class ActorCritic(nn.Module):
         self.actor = nn.Linear(1024, n_actions)
         self.critic = nn.Linear(1024, 1)
 
-    # [Multi-GPU 수정] DataParallel은 forward 메서드를 자동으로 병렬화합니다.
     # 기존 get_action_and_value의 로직을 forward로 이동합니다.
     def forward(self, obs, action=None, action_mask=None):
         # obs: (B, H, W, C) -> (B, C, H, W)
@@ -90,6 +89,22 @@ class ChessSymmetricEnv(gym.Env):
         
         self.current_agent = "player_0"
         self.step_count = 0
+        
+    def _get_material_value(self, board):
+        piece_values = {
+            chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3,
+            chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0
+        }
+
+        white_score = 0
+        black_score = 0
+        for piece_type, v in piece_values.items():
+            white_score += len(board.pieces(piece_type, chess.WHITE)) * v
+            black_score += len(board.pieces(piece_type, chess.BLACK)) * v
+
+        # 항상 "화이트 - 블랙" 형태로만 반환
+        return white_score - black_score
+
 
     def reset(self, seed=None, options=None):
         self.aec_env.reset(seed=seed)
@@ -102,28 +117,55 @@ class ChessSymmetricEnv(gym.Env):
         return obs, {"action_mask": mask}
 
     def step(self, action):
+        # 현재 수를 둘 플레이어의 색을 미리 저장
+        board_before = self.aec_env.board
+        mover_is_white = board_before.turn == chess.WHITE
+
+        prev_score = self._get_material_value(board_before)
+
+        # 실제 수 두기
         self.aec_env.step(int(action))
         self.step_count += 1
-        
+
         terminations = self.aec_env.terminations
         truncations = self.aec_env.truncations
-        
+
+        # 게임 종료 처리
         if any(terminations.values()) or any(truncations.values()):
             rewards = self.aec_env.rewards
-            my_reward = rewards[self.current_agent]
-            
+            my_reward = rewards[self.current_agent]  # 이 시점에서 current_agent는 여전히 수를 둔 쪽
+
+            # 승/패 보상 스케일 (필요시 조절)
+            final_reward = float(my_reward) * 10.0
+
             dummy_obs = np.zeros(self.observation_space.shape, dtype=np.float32)
             dummy_mask = np.ones(self.action_space.n, dtype=np.float32)
-            
-            return dummy_obs, float(my_reward), True, False, {"action_mask": dummy_mask, "winner": self.current_agent}
 
+            return dummy_obs, final_reward, True, False, {
+                "action_mask": dummy_mask,
+                "winner": self.current_agent,
+            }
+
+        # 비종료 상태: 다음 플레이어 관점 관찰
         self.current_agent = self.aec_env.agent_selection
         obs_dict = self.aec_env.observe(self.current_agent)
         next_obs = obs_dict["observation"].astype(np.float32)
         next_mask = obs_dict["action_mask"].astype(np.float32)
-        
-        step_reward = 0.0
-        return next_obs, step_reward, False, False, {"action_mask": next_mask}
+
+        # 새 점수 (항상 화이트-블랙)
+        new_score = self._get_material_value(self.aec_env.board)
+
+        # 이번 수를 둔 쪽 관점에서의 점수 변화량
+        if mover_is_white:
+            material_diff = new_score - prev_score   # 화이트 입장
+        else:
+            material_diff = prev_score - new_score   # 블랙 입장(부호 반전)
+
+        # 스케일링 (0.01 ~ 0.1 정도 시도)
+        material_reward = material_diff * 0.1
+
+        return next_obs, material_reward, False, False, {"action_mask": next_mask}
+
 
     def render(self):
         return self.aec_env.render()
@@ -136,11 +178,11 @@ class ChessSymmetricEnv(gym.Env):
 # ==========================================
 @dataclass
 class PPOConfig:
-    exp_name: str = "ppo_chess_selfplay_gpu"
+    exp_name: str = "ppo_chess_selfplay_gpu_cnn"
     total_timesteps: int = 300_000_000
     learning_rate: float = 2.5e-4
-    num_steps: int = 1024
-    num_envs: int = 64
+    num_steps: int = 512
+    num_envs: int = 32
     minibatch_size: int = 2048
     update_epochs: int = 4
     
@@ -158,6 +200,7 @@ class PPOConfig:
     # Stockfish 경로 확인 필요 (User 환경에 맞게)
     stockfish_path: str = "/usr/games/stockfish"
     stockfish_eval_skill: int = 0
+    stockfish_eval_time_limit: float = 0
     eval_interval: int = 50
     eval_games: int = 16
 
@@ -375,12 +418,16 @@ def train(config: PPOConfig):
                         "eval/win_rate": win, 
                         "eval/draw_rate": draw, 
                         "eval/loss_rate": loss, 
-                        "global_step": global_step
+                        "eval/stockfish_time_limit": config.stockfish_eval_time_limit,
+                        "global_step": global_step,
+                        # "stockfish_skill": config.stockfish_eval_skill
                     })
                 
                 if win + draw == 1.0:
-                    print("[EVAL] Perfect performance against Stockfish achieved! stockfish_eval_skill increased.")
-                    config.stockfish_eval_skill = min(config.stockfish_eval_skill + 1, 20)
+                    print("[EVAL] Perfect performance against Stockfish achieved! stockfish_eval_time_limit increased.")
+                    # config.stockfish_eval_skill = min(config.stockfish_eval_skill + 1, 20)
+                    config.stockfish_eval_time_limit = min(config.stockfish_eval_time_limit + 0.01, 0.1)
+
                     
                     
             except Exception as e:
