@@ -164,41 +164,38 @@ class ChessSymmetricEnv(gym.Env):
         return obs.astype(np.float32), {"action_mask": mask.astype(np.float32)}
 
     def step(self, action):
-        # 1. Execute action for current agent
-        self.aec_env.step(action)
-        
-        # 2. Check game state after move
-        obs_dict, reward, terminated, truncated, info = self.aec_env.last()
-        
-        # 만약 게임이 끝났다면 obs_dict가 None일 수 있는 구버전 이슈 방지 및 데이터 추출
-        if obs_dict is None:
-             # 종료 시 더미 데이터 반환 (PettingZoo 버전에 따라 다를 수 있음)
-             obs = np.zeros(self.observation_space.shape, dtype=np.float32)
-             mask = np.ones(self.action_space.n, dtype=np.float32)
-        else:
-             obs = obs_dict["observation"]
-             mask = obs_dict["action_mask"]
+            # 1. 방금 수를 두는 에이전트가 누구인지 기억 (예: player_0)
+            mover = self.aec_env.agent_selection
 
-        # If the game ended immediately after my move
-        if terminated or truncated:
-            board = self.aec_env.unwrapped.board
+            # 2. Action 실행 (턴이 다음 플레이어로 넘어감)
+            self.aec_env.step(action)
             
-            if board.is_repetition(3):
-                reward = -0.5
-            elif board.is_fifty_moves():
-                reward = -0.5
-            elif board.is_stalemate() or board.is_insufficient_material():
-                reward = -0.1
+            # 3. 다음 상태 관측 (다음 플레이어의 시점)
+            obs_dict, _, terminated, truncated, info = self.aec_env.last()
+            
+            # 데이터 추출
+            if obs_dict is None:
+                obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+                mask = np.ones(self.action_space.n, dtype=np.float32)
+            else:
+                obs = obs_dict["observation"]
+                mask = obs_dict["action_mask"]
 
-            return obs.astype(np.float32), float(reward), True, False, {"action_mask": mask.astype(np.float32)}
+            real_reward = self.aec_env.rewards.get(mover, 0.0)
 
-        # 3. Reward Shaping (Optional)
-        board = self.aec_env.unwrapped.board
-        # material_score = self._get_material_score(board) # 필요한 경우 사용
-        
-        current_reward = 0.0 # 체스는 일반적으로 종료 시에만 보상을 줌
-        
-        return obs.astype(np.float32), current_reward, False, False, {"action_mask": mask.astype(np.float32)}
+            if terminated or truncated:
+                board = self.aec_env.unwrapped.board
+                
+                if not board.is_checkmate(): # 체크메이트가 아닌데 끝났다면 = 무승부
+                    if board.is_repetition(3) or board.is_fifty_moves() or board.is_insufficient_material():
+                        # 무승부는 지는 것보다는 낫지만(-1.0), 이기는 것보다는 못함
+                        # 여기서는 "비기는 행위"를 억제하기 위해 음수 보상 부여
+                        real_reward = -0.5 
+
+                return obs.astype(np.float32), float(real_reward), True, False, {"action_mask": mask.astype(np.float32)}
+
+            # 6. 게임 진행 중 (희소 보상)
+            return obs.astype(np.float32), float(real_reward), False, False, {"action_mask": mask.astype(np.float32)}
 
     def close(self):
         self.aec_env.close()
