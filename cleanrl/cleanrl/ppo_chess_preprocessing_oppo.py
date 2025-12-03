@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
+# import multiprocessing as mp
 from torch.utils.data import DataLoader, TensorDataset
 from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -18,9 +19,233 @@ import wandb
 import chess
 import chess.engine
 from pettingzoo.classic import chess_v6
+import cv2
+from other_model.chess_minimax import encode_move
 
-from other_model.chess_minimax import evaluate_vs_stockfish
-# import multiprocessing as mp
+# =============================================================================
+#  [Helper Class] Stockfish Environment
+# =============================================================================
+class StockfishEvalEnv(gym.Env):
+    def __init__(self, stockfish_path, skill_level=0, time_limit=0.05, render_mode=None):
+        super().__init__()
+        self.aec_env = chess_v6.env(render_mode=render_mode)
+        self.time_limit = time_limit
+        self.aec_env.reset()
+        
+        # Stockfish 엔진 인스턴스 생성
+        try:
+            self.engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            self.engine.configure({"Skill Level": skill_level})
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Stockfish path incorrect: {stockfish_path}")
+
+        raw_obs_space = self.aec_env.observation_space("player_0")["observation"]
+        self.observation_space = spaces.Box(low=0, high=1, shape=raw_obs_space.shape, dtype=np.float32)
+        self.action_space = self.aec_env.action_space("player_0")
+
+    def render(self):
+        return self.aec_env.render()
+
+    def play_match(self, agent, device, play_as_white=True, record_video=False):
+        self.aec_env.reset()
+        agent_player = "player_0" if play_as_white else "player_1"
+        frames = [] 
+
+        for agent_selection in self.aec_env.agent_iter():
+            observation, reward, termination, truncation, info = self.aec_env.last()
+            
+            if record_video:
+                frame = self.render()
+                if frame is not None: frames.append(frame)
+
+            if termination or truncation:
+                rewards = self.aec_env.rewards
+                agent_score = rewards[agent_player]
+                action = None
+                self.aec_env.step(action)
+                
+                result = 0
+                if agent_score > 0: result = 1    # Win
+                elif agent_score < 0: result = -1 # Loss
+                
+                return result, frames
+
+            if agent_selection == agent_player:
+                # === Agent Turn ===
+                obs_data = observation["observation"].copy() 
+                mask_data = observation["action_mask"].copy()
+                
+                obs_tensor = torch.tensor(obs_data, dtype=torch.float32, device=device).unsqueeze(0)
+                mask_tensor = torch.tensor(mask_data, dtype=torch.float32, device=device).unsqueeze(0)
+                
+                with torch.no_grad():
+                    # 병렬 워커에서는 DDP나 module이 없을 수 있으므로 체크
+                    if hasattr(agent, 'module'):
+                        action_idx, _, _, _ = agent.module.forward(obs_tensor, action_mask=mask_tensor)
+                    else:
+                        action_idx, _, _, _ = agent.forward(obs_tensor, action_mask=mask_tensor)
+                
+                action = action_idx.item()
+            else:
+                # === Stockfish Turn ===
+                board = self.aec_env.unwrapped.board
+                limit = chess.engine.Limit(time=self.time_limit)
+                result_engine = self.engine.play(board, limit)
+                
+                if result_engine.move is None:
+                    action = self.aec_env.action_space(agent_selection).sample(observation["action_mask"])
+                else:
+                    is_black = (agent_selection == "player_1")
+                    try:
+                        action = encode_move(result_engine.move, should_mirror=is_black)
+                    except:
+                        action = self.aec_env.action_space(agent_selection).sample(observation["action_mask"])
+
+            self.aec_env.step(action)
+
+        return 0, frames
+
+    def close(self):
+        if hasattr(self, 'engine'):
+            self.engine.quit()
+        self.aec_env.close()
+
+# =============================================================================
+#  [Parallel Worker Function]
+#  이 함수는 각 프로세스(CPU 코어)에서 독립적으로 실행됩니다.
+# =============================================================================
+def run_eval_worker(game_idx, config, model_state_dict, obs_shape, n_actions):
+    """
+    단일 게임을 수행하는 워커 함수
+    """
+    # 1. 각 프로세스마다 별도의 CPU Device 사용 (CUDA Context 충돌 방지)
+    device = torch.device("cpu")
+    
+    # 2. 모델 재생성 및 가중치 로드
+    # (ActorCritic 클래스가 이 파일 내에 있거나 import 가능해야 함)
+    local_agent = ChessAgent(obs_shape, n_actions).to(device)
+    local_agent.load_state_dict(model_state_dict)
+    local_agent.eval()
+
+    # 3. 환경 생성
+    try:
+        env = StockfishEvalEnv(config.stockfish_path, skill_level=config.stockfish_eval_skill, time_limit=config.stockfish_eval_time_limit)
+    except Exception as e:
+        print(f"[Worker Error] Failed to init Env: {e}")
+        return 0 # 에러 시 무승부 처리 또는 예외 발생
+
+    # 4. 게임 진행
+    play_as_white = (game_idx % 2 == 0)
+    try:
+        # 비디오 녹화는 워커에서 하지 않음 (False)
+        result, _ = env.play_match(local_agent, device, play_as_white=play_as_white, record_video=False)
+    except Exception as e:
+        print(f"[Worker Error] Game {game_idx} failed: {e}")
+        result = 0
+    finally:
+        env.close()
+
+    return result
+
+# =============================================================================
+#  [Main Evaluation Function]
+# =============================================================================
+def evaluate_vs_stockfish(agent, device, config, num_games=10, update=0):
+    
+    # -----------------------------------------------------
+    # 1. 첫 번째 게임: 비디오 녹화를 위해 메인 프로세스에서 실행
+    # -----------------------------------------------------
+    print(f"[EVAL] Playing video match (Game 1/{num_games})...")
+    
+    # 영상 저장을 위한 Eval Env
+    video_env = StockfishEvalEnv(
+        config.stockfish_path, 
+        skill_level=config.stockfish_eval_skill, 
+        time_limit=config.stockfish_eval_time_limit,
+        render_mode="rgb_array"
+    )
+    
+    # DDP 등으로 감싸진 모델의 원본을 가져오기 (state_dict 추출용)
+    raw_model = agent.module if hasattr(agent, "module") else agent
+    raw_model.eval()
+
+    # 첫 번째 판 실행
+    video_result, frames = video_env.play_match(
+        raw_model, device, play_as_white=True, record_video=True
+    )
+    video_env.close()
+    
+    results = [video_result] # 결과 리스트 시작
+
+    # 영상 저장 (OpenCV)
+    video_dir = f"videos/{config.exp_name}"
+    os.makedirs(video_dir, exist_ok=True)
+    
+    if frames:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        outcome = "Win" if video_result == 1 else "Loss" if video_result == -1 else "Draw"
+        filename = f"{video_dir}/step_{update}_White_{outcome}.mp4"
+        
+        try:
+            height, width, layers = frames[0].shape
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+            out = cv2.VideoWriter(filename, fourcc, 2.0, (width, height))
+            for frame in frames:
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                out.write(frame_bgr)
+            out.release()
+            print(f"[VIDEO] Saved to {filename}")
+        except Exception as e:
+            print(f"[ERROR] Video save failed: {e}")
+
+    # -----------------------------------------------------
+    # 2. 나머지 게임: 멀티프로세싱으로 병렬 실행
+    # -----------------------------------------------------
+    remaining_games = num_games - 1
+    if remaining_games > 0:
+        print(f"[EVAL] Playing {remaining_games} games in parallel...")
+        
+        # 모델의 가중치를 CPU로 이동 (프로세스 간 공유를 위해)
+        cpu_state_dict = {k: v.cpu() for k, v in raw_model.state_dict().items()}
+        
+        # 모델 구조 정보 추출 (ActorCritic 재생성용)
+        # obs_shape=(8,8,111), n_actions=4672 등
+        obs_shape = (video_env.aec_env.observation_space("player_0")["observation"].shape[0],
+                     video_env.aec_env.observation_space("player_0")["observation"].shape[1],
+                     video_env.aec_env.observation_space("player_0")["observation"].shape[2])
+        n_actions = video_env.aec_env.action_space("player_0").n
+
+        # 워커 함수에 전달할 고정 인자들을 묶음 (partial)
+        worker_fn = functools.partial(
+            run_eval_worker, 
+            config=config, 
+            model_state_dict=cpu_state_dict,
+            obs_shape=obs_shape,
+            n_actions=n_actions
+        )
+
+        # 게임 인덱스 리스트 (1부터 시작)
+        game_indices = range(1, num_games)
+
+        # CPU 코어 수만큼 프로세스 풀 생성 (너무 많으면 오버헤드 발생, 보통 cpu_count 사용)
+        num_workers = min(multiprocessing.cpu_count(), 4)
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # 병렬 실행 및 결과 수집
+            parallel_results = list(executor.map(worker_fn, game_indices))
+        
+        results.extend(parallel_results)
+
+    # -----------------------------------------------------
+    # 3. 결과 집계
+    # -----------------------------------------------------
+    agent.train() # 다시 학습 모드로 전환
+    
+    win_rate = results.count(1) / num_games
+    draw_rate = results.count(0) / num_games
+    loss_rate = results.count(-1) / num_games
+    
+    return win_rate, draw_rate, loss_rate
 
 # ==========================================
 # 0. Configuration (개선됨)
@@ -42,7 +267,7 @@ class PPOConfig:
     update_epochs: int = 8      # 4->8 (충분한 학습)
 
     # Pre-training (대폭 증가)
-    pretrain_samples: int = 50   # 10k->50k
+    pretrain_samples: int = 50_000   # 10k->50k
     pretrain_epochs: int = 20         # 10->20
     pretrain_batch_size: int = 256
     
@@ -92,54 +317,9 @@ class PPOConfig:
             ]
 
 
-
 # ==========================================
-# 1. Environment (보상 구조 개선)
+# 1. Environment (보상 구조 + encode_move)
 # ==========================================
-
-# _KNIGHT_MOVES_CACHE = {
-#     (1, 2): 56, (2, 1): 57, (2, -1): 58, (1, -2): 59,
-#     (-1, -2): 60, (-2, -1): 61, (-2, 1): 62, (-1, 2): 63
-# }
-# _DIRECTIONS = [(0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1), (-1, 0), (-1, 1)]
-
-# def move_to_action(move: chess.Move) -> int:
-#     if move is None: return 0
-#     from_sq = move.from_square
-#     to_sq = move.to_square
-#     df = chess.square_file(to_sq) - chess.square_file(from_sq)
-#     dr = chess.square_rank(to_sq) - chess.square_rank(from_sq)
-
-#     if (df, dr) in _KNIGHT_MOVES_CACHE:
-#         return from_sq * 73 + _KNIGHT_MOVES_CACHE[(df, dr)]
-
-#     if move.promotion is not None and move.promotion != chess.QUEEN:
-#         return None
-
-#     for dir_idx, (dir_x, dir_y) in enumerate(_DIRECTIONS):
-#         if df * dir_y - dr * dir_x == 0 and df * dir_x + dr * dir_y > 0:
-#             distance = max(abs(df), abs(dr))
-#             if 1 <= distance <= 7:
-#                 return from_sq * 73 + dir_idx * 7 + (distance - 1)
-#     return None
-
-def encode_move(move: chess.Move, should_mirror: bool = False) -> int:
-    """
-    chess.Move 객체를 PettingZoo Action ID(int)로 변환합니다.
-    should_mirror: 현재 턴이 Black이라면 True (PettingZoo는 흑번일 때 보드를 뒤집어서 계산함)
-    """
-    if should_mirror:
-        move = mirror_move(move)
-
-    TOTAL = 73
-    source = move.from_square
-    coord = square_to_coord(source)
-    panel = get_move_plane(move)
-    
-    # (row * 8 + col) * 73 + panel
-    # 주의: square_to_coord의 리턴은 (col, row) 형태
-    cur_action = (coord[0] * 8 + coord[1]) * TOTAL + panel
-    return cur_action
 
 class ChessSymmetricEnv(gym.Env):
     """개선된 보상 구조"""
@@ -174,8 +354,14 @@ class ChessSymmetricEnv(gym.Env):
         board = self.aec_env.unwrapped.board
         self.prev_material = self._get_material_score(board)
         self.move_count = 0
+
+        # === 추가: 현재 둘 차례가 백인지 여부 ===
+        current_is_white = (self.aec_env.agent_selection == "player_0")
         
-        return obs.astype(np.float32), {"action_mask": mask.astype(np.float32)}
+        return obs.astype(np.float32), {
+            "action_mask": mask.astype(np.float32),
+            "current_player_is_white": np.array(current_is_white, dtype=np.float32),
+        }
 
     def step(self, action):
         mover = self.aec_env.agent_selection
@@ -198,12 +384,12 @@ class ChessSymmetricEnv(gym.Env):
         if terminated or truncated:
             # 1. 게임 종료 보상
             if board.is_checkmate():
-                # 승리자 확인
-                winner = self.aec_env.unwrapped.board.turn  # False=Black won, True=White won
+                # winner 변수 이름이 헷갈리지만, 실제로는 '패한 쪽이 white인가'를 나타냄
+                loser_is_white = self.aec_env.unwrapped.board.turn  # True=White(패), False=Black(패)
                 is_white = (mover == "player_0")
                 
                 # 현재 플레이어가 이겼는지 확인
-                if (is_white and not winner) or (not is_white and winner):
+                if (is_white and not loser_is_white) or (not is_white and loser_is_white):
                     reward = 1.0  # 승리
                 else:
                     reward = -1.0  # 패배
@@ -238,10 +424,23 @@ class ChessSymmetricEnv(gym.Env):
             if self.move_count > 100:
                 reward -= 0.001 * (self.move_count - 100)
 
-        return obs.astype(np.float32), float(reward), terminated or truncated, False, {"action_mask": mask.astype(np.float32)}
+        # === 추가: 다음 수를 둘 플레이어 색상 ===
+        current_is_white = (self.aec_env.agent_selection == "player_0")
+
+        return (
+            obs.astype(np.float32),
+            float(reward),
+            terminated or truncated,
+            False,
+            {
+                "action_mask": mask.astype(np.float32),
+                "current_player_is_white": np.array(current_is_white, dtype=np.float32),
+            },
+        )
 
     def close(self):
         self.aec_env.close()
+
 
 # ==========================================
 # 2. Model (동일)
@@ -324,10 +523,13 @@ class ChessAgent(nn.Module):
 
         return action, dist.log_prob(action), dist.entropy(), value
 
+
 # ==========================================
-# 3. Pre-training (동일하게 유지)
+# 3. Pre-training (tqdm 진행률 표시 추가)
 # ==========================================
-def collect_worker(rank, sample_count, config, seed):
+from tqdm import tqdm
+
+def collect_worker(rank, sample_count, config, seed, progress_queue=None):
     process_seed = seed + rank
     np.random.seed(process_seed)
     random.seed(process_seed)
@@ -336,7 +538,7 @@ def collect_worker(rank, sample_count, config, seed):
     try:
         engine = chess.engine.SimpleEngine.popen_uci(config.stockfish_path)
         skill = getattr(config, 'stockfish_eval_skill', 0)
-        engine.configure({"Skill Level": skill})
+        engine.configure({"Skill Level": skill, "Threads": 1})
     except Exception as e:
         print(f"[Worker {rank}] Error starting Stockfish: {e}")
         return [], [], []
@@ -364,24 +566,42 @@ def collect_worker(rank, sample_count, config, seed):
             value_target = np.tanh(score / 100.0) if score is not None else 0.0
             
             action_idx = encode_move(best_move, should_mirror=(board.turn == chess.BLACK))
+
             
             if action_idx is not None and info["action_mask"][action_idx] == 1:
                 obs_list.append(obs)
                 act_list.append(action_idx)
                 val_list.append(value_target)
                 
+                # 진행률 업데이트
+                if progress_queue is not None:
+                    progress_queue.put(1)
+                
                 obs, _, terminated, truncated, info = env.step(action_idx)
                 if terminated or truncated:
                     obs, info = env.reset()
             else:
+                print(f"\n[DEBUG] Move Rejected!")
+                print(f"Turn: {'Black' if board.turn == chess.BLACK else 'White'}")
+                print(f"Stockfish Move: {best_move}")
+                print(f"Encoded Action ID: {action_idx}")
+                print(f"Should Mirror: {board.turn == chess.BLACK}")
+                if action_idx is not None:
+                     print(f"Action Mask at ID: {info['action_mask'][action_idx]}")
+
                 valid_actions = np.where(info["action_mask"])[0]
                 if len(valid_actions) > 0:
                     action = np.random.choice(valid_actions)
                     obs, _, term, trunc, info = env.step(action)
-                    if term or trunc: obs, info = env.reset()
+                    if term or trunc:
+                        obs, info = env.reset()
                 else:
                     obs, info = env.reset()
-        except Exception:
+        except Exception as e:
+            print(f"\n[DEBUG] Exception during analysis or step: {e}")
+            import traceback
+            traceback.print_exc()
+
             obs, info = env.reset()
 
     engine.quit()
@@ -399,20 +619,51 @@ def collect_stockfish_data(config):
         except Exception as e:
             print(f"[WARN] Failed to load dataset: {e}. Starting fresh collection.")
 
-    num_workers = min(mp.cpu_count(), 12)
+    num_workers = min(mp.cpu_count(), 16)  # 최대 16개 워커 사용
     samples_per_worker = config.pretrain_samples // num_workers
     remainder = config.pretrain_samples % num_workers
     
     print(f"[PRE] Collecting {config.pretrain_samples} samples using {num_workers} workers...")
     
+    # 멀티프로세싱 매니저로 진행률 큐 생성
+    manager = mp.Manager()
+    progress_queue = manager.Queue()
+    
     worker_args = []
     for i in range(num_workers):
         count = samples_per_worker + (remainder if i == num_workers - 1 else 0)
-        worker_args.append((i, count, config, config.seed))
+        worker_args.append((i, count, config, config.seed, progress_queue))
 
     t_start = time.time()
-    with mp.Pool(processes=num_workers) as pool:
-        results = pool.starmap(collect_worker, worker_args)
+    
+    # tqdm 진행률 표시줄 생성
+    with tqdm(total=config.pretrain_samples, desc="Collecting samples", unit="sample") as pbar:
+        # 워커 프로세스 시작
+        with mp.Pool(processes=num_workers) as pool:
+            # 비동기로 작업 시작
+            async_result = pool.starmap_async(collect_worker, worker_args)
+            
+            # 진행률 업데이트
+            completed = 0
+            while not async_result.ready():
+                try:
+                    # 0.1초마다 큐 확인
+                    while not progress_queue.empty():
+                        progress_queue.get()
+                        completed += 1
+                        pbar.update(1)
+                    time.sleep(0.1)
+                except:
+                    pass
+            
+            # 나머지 진행률 업데이트
+            while not progress_queue.empty():
+                progress_queue.get()
+                completed += 1
+                pbar.update(1)
+            
+            # 결과 가져오기
+            results = async_result.get()
     
     all_obs, all_acts, all_vals = [], [], []
     total_collected = 0
@@ -439,7 +690,8 @@ def collect_stockfish_data(config):
 
 def pretrain_supervised(agent, device, config):
     obs, acts, vals = collect_stockfish_data(config)
-    if obs is None: return
+    if obs is None:
+        return
 
     dataset = TensorDataset(
         torch.tensor(obs, dtype=torch.float32),
@@ -479,8 +731,9 @@ def pretrain_supervised(agent, device, config):
     os.makedirs("models", exist_ok=True)
     torch.save(agent.state_dict(), f"models/{config.exp_name}_pretrained.pt")
 
+
 # ==========================================
-# 4. Main Training Loop (수정됨)
+# 4. Main Training Loop (+ opponent pool)
 # ==========================================
 def make_env():
     return ChessSymmetricEnv()
@@ -495,7 +748,10 @@ def train(config: PPOConfig):
     print(f"[INFO] Creating {config.num_envs} environments...")
     envs = AsyncVectorEnv([make_env for _ in range(config.num_envs)], daemon=True)
 
-    agent = ChessAgent(obs_shape=(8, 8, 111), n_actions=4672).to(device)
+    obs_shape = (8, 8, 111)
+    n_actions = 4672
+
+    agent = ChessAgent(obs_shape=obs_shape, n_actions=n_actions).to(device)
     
     if config.resume:
         agent.load_state_dict(torch.load(config.resume, map_location=device, weights_only=True))
@@ -512,6 +768,9 @@ def train(config: PPOConfig):
     scheduler = CosineAnnealingLR(optimizer, T_max=config.total_timesteps // (config.num_steps * config.num_envs))
     scaler = GradScaler('cuda') if config.use_mixed_precision else None
 
+    # --- Opponent pool: 이전 에이전트 스냅샷들 ---
+    opponent_pool = []  # type: list[ChessAgent]
+
     # Storage
     obs_buffer = torch.zeros((config.num_steps, config.num_envs, 8, 8, 111), device=device)
     actions_buffer = torch.zeros((config.num_steps, config.num_envs), dtype=torch.long, device=device)
@@ -519,12 +778,22 @@ def train(config: PPOConfig):
     rewards_buffer = torch.zeros((config.num_steps, config.num_envs), device=device)
     dones_buffer = torch.zeros((config.num_steps, config.num_envs), device=device)
     values_buffer = torch.zeros((config.num_steps, config.num_envs), device=device)
-    masks_buffer = torch.zeros((config.num_steps, config.num_envs, 4672), dtype=torch.bool, device=device)
+    masks_buffer = torch.zeros((config.num_steps, config.num_envs, n_actions), dtype=torch.bool, device=device)
+    agent_turn_buffer = torch.zeros((config.num_steps, config.num_envs), dtype=torch.bool, device=device)
 
     next_obs_np, next_info = envs.reset(seed=config.seed)
     next_obs = torch.tensor(next_obs_np, device=device)
     next_done = torch.zeros(config.num_envs, device=device)
     next_mask = torch.tensor(next_info["action_mask"], device=device)
+    next_player_is_white = torch.tensor(
+        next_info.get("current_player_is_white", np.ones(config.num_envs, dtype=np.float32)),
+        device=device,
+        dtype=torch.bool,
+    )
+
+    # 각 env마다 "내 에이전트가 백을 둘지" 여부, "어떤 opponent snapshot을 쓸지"를 기록
+    learner_plays_white = np.random.randint(0, 2, size=config.num_envs).astype(bool)
+    opponent_indices = np.full(config.num_envs, -1, dtype=np.int64)
     
     global_step = 0
     num_updates = config.total_timesteps // (config.num_steps * config.num_envs)
@@ -551,22 +820,82 @@ def train(config: PPOConfig):
             dones_buffer[step] = next_done
             masks_buffer[step] = next_mask.bool()
 
-            with torch.no_grad():
-                action, logprob, _, value = agent(next_obs, action_mask=next_mask)
-                values_buffer[step] = value.flatten()
-            
-            actions_buffer[step] = action
-            logprobs_buffer[step] = logprob
+            # === 어떤 env에서 내 에이전트가 두는지 결정 ===
+            if len(opponent_pool) == 0:
+                # 초기에는 opponent_pool이 없으므로 self-play (현재 agent가 양쪽 모두)
+                use_current_agent = torch.ones(config.num_envs, dtype=torch.bool, device=device)
+            else:
+                learner_white_tensor = torch.from_numpy(learner_plays_white).to(device=device)
+                use_current_agent = (next_player_is_white == learner_white_tensor)
+            agent_turn_buffer[step] = use_current_agent
 
-            real_next_obs, reward, terminated, truncated, info = envs.step(action.cpu().numpy())
+            with torch.no_grad():
+                # Critic은 항상 현재 agent로 계산 (모든 상태에서 가치 예측)
+                value = agent.get_value(next_obs).reshape(-1)
+                values_buffer[step] = value
+
+                actions = torch.empty(config.num_envs, dtype=torch.long, device=device)
+                logprobs = torch.empty(config.num_envs, device=device)
+
+                # 1) 내 에이전트가 두는 env들
+                if use_current_agent.any():
+                    idx = use_current_agent.nonzero(as_tuple=False).squeeze(-1)
+                    a, lp, _, _ = agent(next_obs[idx], action_mask=next_mask[idx])
+                    actions[idx] = a
+                    logprobs[idx] = lp
+
+                # 2) opponent가 두는 env들
+                if (~use_current_agent).any():
+                    opp_idx = (~use_current_agent).nonzero(as_tuple=False).squeeze(-1)
+                    for i in opp_idx:
+                        i_int = int(i.item())
+                        if len(opponent_pool) == 0 or opponent_indices[i_int] < 0:
+                            # fallback: self-play
+                            a, lp, _, _ = agent(
+                                next_obs[i_int].unsqueeze(0),
+                                action_mask=next_mask[i_int].unsqueeze(0),
+                            )
+                            actions[i_int] = a.squeeze(0)
+                            logprobs[i_int] = lp.squeeze(0)
+                        else:
+                            opp = opponent_pool[opponent_indices[i_int]]
+                            with torch.no_grad():
+                                a_opp, _, _, _ = opp(
+                                    next_obs[i_int].unsqueeze(0),
+                                    action_mask=next_mask[i_int].unsqueeze(0),
+                                    eval_mode=True,  # 상대는 greedy로 두도록
+                                )
+                            actions[i_int] = a_opp.squeeze(0)
+                            # opponent의 수는 PPO 업데이트에서 사용하지 않을 것이므로 logprob은 dummy
+                            logprobs[i_int] = 0.0
+
+            actions_buffer[step] = actions
+            logprobs_buffer[step] = logprobs
+
+            real_next_obs, reward, terminated, truncated, info = envs.step(actions.cpu().numpy())
             done = np.logical_or(terminated, truncated)
             
             rewards_buffer[step] = torch.tensor(reward, device=device).view(-1)
             next_obs = torch.tensor(real_next_obs, device=device)
             next_done = torch.tensor(done, device=device, dtype=torch.float32)
             next_mask = torch.tensor(info["action_mask"], device=device)
+            next_player_is_white = torch.tensor(
+                info.get("current_player_is_white", np.ones(config.num_envs, dtype=np.float32)),
+                device=device,
+                dtype=torch.bool,
+            )
 
-        # --- GAE 계산 (수정됨) ---
+            # 게임이 끝난 env에 대해: 새 게임에서 내 에이전트 색 / opponent 재선택
+            done_indices = np.where(done)[0]
+            if len(done_indices) > 0:
+                for i in done_indices:
+                    learner_plays_white[i] = bool(np.random.randint(2))
+                    if len(opponent_pool) > 0:
+                        opponent_indices[i] = np.random.randint(len(opponent_pool))
+                    else:
+                        opponent_indices[i] = -1
+
+        # --- GAE 계산 (수정 없음) ---
         with torch.no_grad():
             next_value = agent.get_value(next_obs).reshape(-1)  # (num_envs,)
             advantages = torch.zeros_like(rewards_buffer)
@@ -581,7 +910,9 @@ def train(config: PPOConfig):
                     nextvalues = values_buffer[t + 1]            # (num_envs,)
                 
                 delta = rewards_buffer[t] + config.gamma * nextvalues * nextnonterminal - values_buffer[t]
-                advantages[t] = lastgaelam = delta + config.gamma * config.gae_lambda * nextnonterminal * lastgaelam
+                advantages[t] = lastgaelam = (
+                    delta + config.gamma * config.gae_lambda * nextnonterminal * lastgaelam
+                )
             
             returns = advantages + values_buffer
 
@@ -592,9 +923,17 @@ def train(config: PPOConfig):
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values_buffer.reshape(-1)
-        b_masks = masks_buffer.reshape((-1, 4672))
-# --- PPO Update (Gradient Accumulation 추가) ---
-        b_inds = np.arange(config.num_steps * config.num_envs)
+        b_masks = masks_buffer.reshape((-1, n_actions))
+        b_agent_turn = agent_turn_buffer.reshape(-1)
+
+        # --- PPO Update (Gradient Accumulation + opponent filter) ---
+        # 내 에이전트가 실제로 둔 스텝만 학습에 사용
+        b_inds = np.nonzero(b_agent_turn.cpu().numpy())[0]
+        if len(b_inds) == 0:
+            # 이론상 거의 없겠지만, 안전하게 스킵
+            scheduler.step()
+            continue
+
         clipfracs = []
         
         for epoch in range(config.update_epochs):
@@ -606,11 +945,15 @@ def train(config: PPOConfig):
 
                 # Gradient Accumulation 구현
                 mini_batch_size = len(mb_inds) // config.gradient_accumulation_steps
+                if mini_batch_size == 0:
+                    continue
                 
                 for acc_step in range(config.gradient_accumulation_steps):
                     acc_start = acc_step * mini_batch_size
                     acc_end = acc_start + mini_batch_size
                     acc_inds = mb_inds[acc_start:acc_end]
+                    if len(acc_inds) == 0:
+                        continue
                     
                     with autocast('cuda', enabled=config.use_mixed_precision):
                         _, newlogprob, entropy, newvalue = agent(
@@ -670,6 +1013,18 @@ def train(config: PPOConfig):
         
         scheduler.step()
 
+        # --- Opponent pool 업데이트: 100 update마다 스냅샷 추가, 최대 5개 유지 ---
+        if update % 100 == 0:
+            snapshot = ChessAgent(obs_shape=obs_shape, n_actions=n_actions).to(device)
+            snapshot.load_state_dict(agent.state_dict())
+            snapshot.eval()
+            for p in snapshot.parameters():
+                p.requires_grad_(False)
+            opponent_pool.append(snapshot)
+            if len(opponent_pool) > 5:
+                opponent_pool.pop(0)
+            print(f"[OPPONENT] Saved snapshot at update {update} (pool size: {len(opponent_pool)})")
+
         # --- Logging ---
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
@@ -677,10 +1032,12 @@ def train(config: PPOConfig):
 
         if update % 10 == 0:
             sps = int(global_step / (time.time() - start_time))
-            print(f"Update {update}/{num_updates} | Step {global_step:,} | "
-                  f"Reward: {rewards_buffer.mean().item():.4f} | "
-                  f"SPS: {sps} | "
-                  f"ExplainedVar: {explained_var:.3f}")
+            print(
+                f"Update {update}/{num_updates} | Step {global_step:,} | "
+                f"Reward: {rewards_buffer.mean().item():.4f} | "
+                f"SPS: {sps} | "
+                f"ExplainedVar: {explained_var:.3f}"
+            )
             
             if config.logging:
                 wandb.log({
@@ -734,8 +1091,10 @@ def train(config: PPOConfig):
                     update=update
                 )
                 
-                print(f"[EVAL] vs Stockfish(skill={eval_skill}, time={eval_time:.3f}s) - "
-                      f"Win: {win*100:.1f}%, Draw: {draw*100:.1f}%, Loss: {loss*100:.1f}%")
+                print(
+                    f"[EVAL] vs Stockfish(skill={eval_skill}, time={eval_time:.3f}s) - "
+                    f"Win: {win*100:.1f}%, Draw: {draw*100:.1f}%, Loss: {loss*100:.1f}%"
+                )
                 
                 if config.logging:
                     wandb.log({
@@ -774,6 +1133,7 @@ def train(config: PPOConfig):
     
     if config.logging:
         wandb.finish()
+
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
