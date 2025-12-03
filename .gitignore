@@ -33,3 +33,5 @@ htmlcov/
 cleanrl/runs
 cleanrl/wandb
 cleanrl/models
+
+exam_prepare/temps/
