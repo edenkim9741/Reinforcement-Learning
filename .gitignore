@@ -35,3 +35,5 @@ cleanrl/wandb
 cleanrl/models
 
 exam_prepare/temps/
+
+*.pt
