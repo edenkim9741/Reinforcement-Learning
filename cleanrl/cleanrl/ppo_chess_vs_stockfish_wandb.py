@@ -1328,12 +1328,7 @@ class PPOTrainer:
 
                     return win_rate
 
-                
-
-
-
-
-                
+            
                 # Reset counts
                 self.win_count = 0
                 self.loss_count = 0

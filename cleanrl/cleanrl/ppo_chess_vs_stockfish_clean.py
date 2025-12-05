@@ -28,7 +28,6 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
-import multiprocessing as mp
 
 import numpy as np
 import torch
@@ -58,9 +57,9 @@ class Config:
     
     # 학습 하이퍼파라미터
     seed: int = 42
-    total_timesteps: int = 500_000
+    total_timesteps: int = 16_000_000
     learning_rate: float = 3e-4
-    num_envs: int = 4
+    num_envs: int = 16
     num_steps: int = 256
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -74,6 +73,8 @@ class Config:
     norm_adv: bool = True
     clip_vloss: bool = True
     target_kl: Optional[float] = None
+
+    skip_phases: Tuple[int, ...] = ()
     
     # 모델 아키텍처
     num_res_blocks: int = 4
@@ -90,8 +91,8 @@ class Config:
     pretrain_lr: float = 1e-3
     
     # Curriculum Learning 비율
-    phase2_ratio: float = 0.6  # Random 상대 학습 비율
-    phase3_ratio: float = 0.4  # Stockfish 상대 학습 비율
+    phase2_ratio: float = 0.3  # Random 상대 학습 비율
+    phase3_ratio: float = 0.7  # Stockfish 상대 학습 비율
 
 
 # =============================================================================
@@ -229,7 +230,7 @@ class ChessEnvWrapper(gym.Env):
     """
     Gymnasium 호환 체스 환경 래퍼
     
-    Stockfish 또는 Random 상대와 대전 지원
+    Stockfish 또는 Random 상대와 대전
     
     Attributes:
         opponent_type: 상대 유형 ("stockfish" 또는 "random")
@@ -396,6 +397,46 @@ class ChessEnvWrapper(gym.Env):
 # =============================================================================
 # 병렬 환경 실행
 # =============================================================================
+class SimpleVecEnv:
+    """
+    순차 실행 Vectorized Environment
+    
+    Random 상대처럼 I/O가 없는 경우 스레딩 오버헤드 없이 빠르게 실행
+    """
+    
+    def __init__(self, env_fns):
+        self.num_envs = len(env_fns)
+        self.envs = [fn() for fn in env_fns]
+        self.observation_space = self.envs[0].observation_space
+        self.action_space = self.envs[0].action_space
+    
+    def step(self, actions):
+        obs_list, rewards, terminateds, truncateds, infos = [], [], [], [], []
+        for env, action in zip(self.envs, actions):
+            obs, reward, terminated, truncated, info = env.step(action)
+            if terminated or truncated:
+                obs, _ = env.reset()
+            obs_list.append(obs)
+            rewards.append(reward)
+            terminateds.append(terminated)
+            truncateds.append(truncated)
+            infos.append(info)
+        return obs_list, np.array(rewards), np.array(terminateds), np.array(truncateds), infos
+    
+    def reset(self, seed=None, options=None):
+        obs_list, info_list = [], []
+        for i, env in enumerate(self.envs):
+            env_seed = seed + i if seed is not None else None
+            obs, info = env.reset(seed=env_seed, options=options)
+            obs_list.append(obs)
+            info_list.append(info)
+        return obs_list, info_list
+    
+    def close(self):
+        for env in self.envs:
+            env.close()
+
+
 class ThreadedVecEnv:
     """
     ThreadPoolExecutor 기반 병렬 환경
@@ -699,20 +740,18 @@ def generate_stockfish_dataset(
     all_actions = []
     all_masks = []
     
-    # 병렬 실행 (multiprocessing 사용)
+    # 병렬 실행
     start_time = time.time()
     
-    # spawn 방식 사용 (fork 대신)
-    ctx = mp.get_context('spawn')
-    with ctx.Pool(processes=num_workers) as pool:
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
         if verbose:
             results = list(tqdm(
-                pool.imap(_collect_single_game, worker_args),
+                executor.map(_collect_single_game, worker_args),
                 total=num_games,
                 desc="Generating games"
             ))
         else:
-            results = list(pool.map(_collect_single_game, worker_args))
+            results = list(executor.map(_collect_single_game, worker_args))
     
     # 결과 병합
     games_with_data = 0
@@ -793,18 +832,30 @@ class PPOTrainer:
         self.loss_count = 0
         self.draw_count = 0
     
-    def _create_vec_env(self, opponent_type: str, num_envs: int) -> ThreadedVecEnv:
-        """병렬 환경 생성"""
-        env_fns = [
-            lambda: ChessEnvWrapper(
-                opponent_type=opponent_type,
-                stockfish_path=self.config.stockfish_path,
-                stockfish_skill=self.config.stockfish_skill,
-                stockfish_time_limit=self.config.stockfish_time_limit
-            )
-            for _ in range(num_envs)
-        ]
-        return ThreadedVecEnv(env_fns)
+    def _create_vec_env(self, opponent_type: str, num_envs: int):
+        """
+        환경 생성: 상대 유형에 따라 적절한 VecEnv 선택
+        
+        - random: SimpleVecEnv (순차 실행, 오버헤드 없음)
+        - stockfish: ThreadedVecEnv (I/O 병렬화)
+        """
+        def make_env(opp_type):
+            def _init():
+                return ChessEnvWrapper(
+                    opponent_type=opp_type,
+                    stockfish_path=self.config.stockfish_path,
+                    stockfish_skill=self.config.stockfish_skill,
+                    stockfish_time_limit=self.config.stockfish_time_limit
+                )
+            return _init
+        
+        env_fns = [make_env(opponent_type) for _ in range(num_envs)]
+        
+        # Random 상대는 I/O가 없으므로 순차 실행이 더 빠름
+        if opponent_type == "random":
+            return SimpleVecEnv(env_fns)
+        else:
+            return ThreadedVecEnv(env_fns)
     
     def _init_storage(self, num_envs: int):
         """롤아웃 저장소 초기화"""
@@ -971,7 +1022,9 @@ class PPOTrainer:
             최종 승률
         """
         cfg = self.config
-        num_envs = cfg.num_envs * 2 if opponent_type == "stockfish" else cfg.num_envs
+        num_envs = cfg.num_envs
+        if opponent_type == "stockfish":
+            num_envs = cfg.num_envs * 2
         batch_size = num_envs * cfg.num_steps
         num_iterations = total_timesteps // batch_size
         
@@ -1010,11 +1063,12 @@ class PPOTrainer:
             if iteration % 10 == 0:
                 total_games = self.win_count + self.loss_count + self.draw_count
                 win_rate = self.win_count / max(total_games, 1)
+                lose_rate = self.loss_count / max(total_games, 1)
                 sps = int(self.global_step / (time.time() - self.start_time))
                 
                 pbar.set_postfix({
                     'W': self.win_count, 'L': self.loss_count, 'D': self.draw_count,
-                    'WR': f'{win_rate:.1%}', 'SPS': sps
+                    'WR': f'{win_rate:.1%}', 'LR': f'{lose_rate:.1%}', 'SPS': sps
                 })
                 
                 if self.use_wandb:
@@ -1022,6 +1076,7 @@ class PPOTrainer:
                         f"{phase_name}/iteration": iteration,
                         f"{phase_name}/global_step": self.global_step,
                         f"{phase_name}/win_rate": win_rate,
+                        f"{phase_name}/lose_rate": lose_rate,
                         f"{phase_name}/win_count": self.win_count,
                         f"{phase_name}/loss_count": self.loss_count,
                         f"{phase_name}/draw_count": self.draw_count,
@@ -1132,29 +1187,32 @@ class PPOTrainer:
             최종 승률
         """
         cfg = self.config
+
+        if 1 not in cfg.skip_phases:
+            # Phase 1: 데이터셋 기반 프리트레이닝
+            pretrain_path = f"{cfg.model_dir}/ppo_chess_phase1.pt"
+            if os.path.exists(pretrain_path):
+                print(f"Loading pretrained model from {pretrain_path}")
+                self.load_model(pretrain_path)
+            else:
+                self.pretrain_from_dataset(data_path)
+                self.save_model(pretrain_path)
         
-        # Phase 1: 데이터셋 기반 프리트레이닝
-        pretrain_path = f"{cfg.model_dir}/ppo_chess_phase1.pt"
-        if os.path.exists(pretrain_path):
-            print(f"Loading pretrained model from {pretrain_path}")
-            self.load_model(pretrain_path)
-        else:
-            self.pretrain_from_dataset(data_path)
-        
-        # Phase 2: Random 상대와 학습
-        phase2_path = f"{cfg.model_dir}/ppo_chess_phase2.pt"
-        if os.path.exists(phase2_path):
-            print(f"Loading Phase 2 model from {phase2_path}")
-            self.load_model(phase2_path)
-        else:
-            phase2_timesteps = int(cfg.total_timesteps * cfg.phase2_ratio)
-            self.train_phase("random", phase2_timesteps, "Phase2")
-            self.save_model(phase2_path)
+        if 2 not in cfg.skip_phases:
+            # Phase 2: Random 상대와 학습
+            phase2_path = f"{cfg.model_dir}/ppo_chess_phase2.pt"
+            if os.path.exists(phase2_path):
+                print(f"Loading Phase 2 model from {phase2_path}")
+                self.load_model(phase2_path)
+            else:
+                phase2_timesteps = int(cfg.total_timesteps * cfg.phase2_ratio)
+                self.train_phase("random", phase2_timesteps, "Phase2")
+                self.save_model(phase2_path)
         
         # Phase 3: Stockfish 상대와 학습
         phase3_timesteps = int(cfg.total_timesteps * cfg.phase3_ratio)
         final_win_rate = self.train_phase("stockfish", phase3_timesteps, "Phase3")
-        
+    
         self.save_model(f"{cfg.model_dir}/ppo_chess_phase3.pt")
         
         return final_win_rate
@@ -1199,7 +1257,8 @@ class PPOTrainer:
         self.agent.train()
         
         win_rate = wins / num_games
-        print(f"  Eval: W:{wins} D:{draws} L:{losses} ({win_rate:.1%})")
+        lose_rate = losses / num_games
+        print(f"  Eval: W:{wins} D:{draws} L:{losses} ({win_rate:.1%}) ({lose_rate:.1%})")
         return win_rate
     
     def save_model(self, path: str):
@@ -1252,6 +1311,8 @@ def main():
                         help="Stockfish skill level for dataset generation (0-20)")
     parser.add_argument("--data-time", type=float, default=0.01,
                         help="Time limit per move for dataset generation")
+    parser.add_argument("--skip-phases", type=int, nargs='*', default=[],
+                        help="Phases to skip during training (1, 2, 3)")
     
     args = parser.parse_args()
     
@@ -1275,6 +1336,7 @@ def main():
         num_envs=args.num_envs,
         seed=args.seed,
         eval_episodes=args.eval_episodes,
+        skip_phases=tuple(args.skip_phases)
     )
     
     if args.mode == "generate-data":
