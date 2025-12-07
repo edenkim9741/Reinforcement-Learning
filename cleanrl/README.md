@@ -13,6 +13,12 @@ PPO를 활용하여 체스 AI를 커리큘럼 학습 방식으로 훈련하는 �
   ```bash
   pip install -r requirements.txt
   ```
+- Install stockfish 
+  - in ubuntu
+    ```bash
+    sudo apt-get install stockfish
+    ```
+  - or download from [stockfish website](https://stockfishchess.org/download/)
 
 ## Usage
 아래의 명령어를 실행하기 전에 현재 directory가 code인지 확인하세요
